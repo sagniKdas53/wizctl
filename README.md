@@ -1,5 +1,7 @@
 # wizctl
 
+[![CI](https://github.com/sagniKdas53/wizctl/actions/workflows/ci.yml/badge.svg)](https://github.com/sagniKdas53/wizctl/actions/workflows/ci.yml)
+
 A fast, lightweight CLI tool and Python library for controlling WiZ Connected smart light bulbs directly over the local area network (LAN) using UDP broadcast/unicast protocol without cloud dependencies.
 
 ---
