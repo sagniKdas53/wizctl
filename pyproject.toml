@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wizctl"
+version = "0.1.0"
+description = "Control WiZ smart light bulbs over the local LAN"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [
+    { name = "Sagnik" }
+]
+keywords = ["wiz", "iot", "smart-home", "lighting", "pywizlight", "cli"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Home Automation",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "pywizlight>=0.6.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.20.0",
+    "pyinstaller>=6.0.0",
+    "build>=1.0.0",
+    "wheel",
+]
+
+[project.scripts]
+wizctl = "wizctl.cli:entry_point"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "live: marks tests that require a live WiZ device (run with --live)",
+]
