@@ -11,6 +11,7 @@ A fast, lightweight CLI tool and Python library for controlling WiZ Connected sm
 - **Fast Local Control**: Directly controls WiZ bulbs over LAN UDP protocol (no cloud / bridge required).
 - **Comprehensive Controls**: Power (`on`, `off`, `toggle`), brightness, RGB colors, color temperatures (Kelvin), and dynamic WiZ scenes.
 - **Flexible Color Input**: Supports named colors (`warmwhite`, `red`, `cyan`, etc.), 6-digit hex (`#ff5500`), shorthand 3-digit hex (`#f50`), and RGB triples (`255, 128, 0`).
+- **Image palettes**: Extract dominant colors from a photo, then copy a ready-made `wizctl color` command or set a swatch directly.
 - **Scene Presets**: Switch scenes by name (`cozy`, `sunset`, `ocean`, `candlelight`) or ID (`1`-`36`, `40`), and list all scenes with `wizctl scenes`.
 - **Standalone Binary**: Includes a standalone compiled binary executable with zero external runtime dependencies.
 - **Robust Error Handling**: Automatic UDP transport cleanup, timeout detection, and device reachability checks.
@@ -89,6 +90,12 @@ wizctl color #ff5500
 wizctl color "255, 128, 0"
 wizctl color warmwhite
 
+# Open the color picker, then use Up/Down and Enter to send a color.
+wizctl palette ./photo.jpg
+
+# Use palette color 2 immediately.
+wizctl palette ./photo.jpg --apply 2
+
 # Set color temperature in Kelvin (2200K - 6500K)
 wizctl kelvin 2700
 wizctl kelvin 4000
@@ -107,7 +114,7 @@ wizctl scenes
 ## CLI Reference
 
 ```
-usage: wizctl [-h] [-v] [--ip IP] {on,off,toggle,status,color,brightness,kelvin,scene,scenes} ...
+usage: wizctl [-h] [-v] [--ip IP] {on,off,toggle,status,color,palette,brightness,kelvin,scene,scenes} ...
 
 positional arguments:
   on                    turn the bulb on
@@ -115,6 +122,7 @@ positional arguments:
   toggle                toggle bulb power state
   status                show bulb status
   color                 set RGB color (name, #RRGGBB, #RGB, or R,G,B)
+  palette               extract dominant colors from an image
   brightness            set brightness (0-255 or 0%-100%)
   kelvin                set color temperature in Kelvin (e.g. 2700, 4000)
   scene                 set WiZ scene preset by name or ID (e.g. cozy, sunset, 1)
@@ -133,6 +141,32 @@ You can target a specific bulb using any of the following methods:
 1. **CLI Flag**: `wizctl --ip 192.168.0.102 status`
 2. **Environment Variable**: `export WIZ_IP=192.168.0.102` or `export BULB_IP=192.168.0.102`
 3. **Default Config**: Default fallback is `192.168.0.102`.
+
+### Image palettes
+
+`wizctl palette` works with image formats Pillow can read, including JPEG, PNG, WebP, GIF, and TIFF. In a normal terminal it opens a picker with real color swatches. Use Up and Down to select a swatch, then Enter to send it to the bulb. Press `q` or Esc to leave without changing the bulb.
+
+```bash
+# Through the installed command
+wizctl palette IMG_4392.JPG
+
+# Keep the old copy-paste output, useful for scripts and pipes
+wizctl palette IMG_4392.JPG --plain
+
+# Run the checkout helper without installing the package
+./.venv/bin/python scripts/extract_palette.py IMG_4392.JPG --colors 8
+
+# Or use the Make target
+make palette IMAGE=IMG_4392.JPG
+
+# Send the third extracted color to a specific bulb
+wizctl --ip 192.168.0.50 palette IMG_4392.JPG --apply 3
+
+# The helper also accepts --ip when applying a swatch
+./.venv/bin/python scripts/extract_palette.py --ip 192.168.0.50 IMG_4392.JPG --apply 3
+```
+
+`--colors` accepts 1 through 16. `--apply NUMBER` sends a numbered swatch without opening the picker. `--plain` disables the picker, while `--tui` forces it when a compatible terminal is available.
 
 ---
 

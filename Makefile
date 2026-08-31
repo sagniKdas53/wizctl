@@ -1,4 +1,4 @@
-.PHONY: help venv install install-dev test test-live build binary clean
+.PHONY: help venv install install-dev test test-live build binary palette clean
 
 PYTHON ?= python3
 VENV_DIR ?= .venv
@@ -13,6 +13,7 @@ help:
 	@echo "  make test-live    - Run live device integration tests"
 	@echo "  make build        - Build Python wheel and source distribution"
 	@echo "  make binary       - Compile standalone binary executable (dist/wizctl)"
+	@echo "  make palette IMAGE=path - Extract image colors and show wizctl commands"
 	@echo "  make clean        - Remove build artifacts, pycache, dist files"
 
 venv:
@@ -36,6 +37,10 @@ build:
 
 binary:
 	$(VENV_BIN)/pyinstaller --onefile --clean --name wizctl --paths src src/wizctl/__main__.py
+
+palette:
+	@test -n "$(IMAGE)" || (echo "Set IMAGE to an image path, for example: make palette IMAGE=photo.jpg"; exit 2)
+	$(VENV_BIN)/python scripts/extract_palette.py "$(IMAGE)"
 
 clean:
 	rm -rf build/ dist/ *.egg-info/ .pytest_cache/ *.spec

@@ -7,12 +7,31 @@ on:
     branches: [main]
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
+  test-and-build:
+    name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12"]
+        include:
+          - os: ubuntu-latest
+            python-version: "3.9"
+            build: false
+          - os: ubuntu-latest
+            python-version: "3.10"
+            build: false
+          - os: ubuntu-latest
+            python-version: "3.11"
+            build: false
+          - os: ubuntu-latest
+            python-version: "3.12"
+            build: true
+          - os: macos-latest
+            python-version: "3.12"
+            build: true
+          - os: windows-latest
+            python-version: "3.12"
+            build: true
 
     steps:
       - uses: actions/checkout@v4
@@ -26,4 +45,15 @@ jobs:
         run: pip install -e ".[dev]"
 
       - name: Run unit tests
-        run: pytest -v
+        run: python -m pytest -v
+
+      - name: Compile source
+        run: python -m compileall -q src
+
+      - name: Build Python distributions
+        if: matrix.build
+        run: python -m build
+
+      - name: Build standalone executable
+        if: matrix.build
+        run: python -m PyInstaller --onefile --clean --name wizctl --paths src src/wizctl/__main__.py

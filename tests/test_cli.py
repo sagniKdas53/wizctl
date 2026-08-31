@@ -26,6 +26,17 @@ class TestCLIParser:
         assert args.command == "color"
         assert args.value == "red"
 
+    def test_parser_palette_command(self):
+        parser = create_parser()
+        args = parser.parse_args(
+            ["palette", "photo.jpg", "--colors", "8", "--apply", "2", "--plain"]
+        )
+        assert args.command == "palette"
+        assert args.image == "photo.jpg"
+        assert args.colors == 8
+        assert args.apply == 2
+        assert args.plain is True
+
     def test_parser_brightness_command(self):
         parser = create_parser()
         args = parser.parse_args(["brightness", "50%"])

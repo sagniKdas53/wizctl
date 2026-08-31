@@ -20,6 +20,8 @@ from wizctl.bulb import (
     command_status,
     command_toggle,
 )
+from wizctl.palette import PaletteError, extract_palette, format_palette
+from wizctl.palette_tui import PaletteTuiError, choose_palette_color, supports_tui
 from wizctl.parsers import die
 
 
@@ -56,6 +58,31 @@ def create_parser() -> argparse.ArgumentParser:
     color.add_argument(
         "value",
         help="color name (e.g. red, cyan, warmwhite), hex (#ff5500, #f50), or RGB (255,128,0)",
+    )
+
+    palette = sub.add_parser("palette", help="extract dominant colors from an image")
+    palette.add_argument("image", help="path to an image file")
+    palette.add_argument(
+        "--colors",
+        type=int,
+        default=6,
+        help="number of colors to extract, from 1 to 16 (default: 6)",
+    )
+    palette.add_argument(
+        "--apply",
+        type=int,
+        metavar="NUMBER",
+        help="set the numbered palette color on the bulb",
+    )
+    palette.add_argument(
+        "--plain",
+        action="store_true",
+        help="print the palette instead of opening the interactive picker",
+    )
+    palette.add_argument(
+        "--tui",
+        action="store_true",
+        help="open the interactive palette picker",
     )
 
     brightness = sub.add_parser("brightness", help="set brightness")
@@ -100,6 +127,21 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
             await command_status(ip)
         elif args.command == "color":
             await command_color(ip, args.value)
+        elif args.command == "palette":
+            palette = extract_palette(args.image, args.colors)
+            if args.apply is not None:
+                if not 1 <= args.apply <= len(palette):
+                    raise ValueError(
+                        f"palette choice must be between 1 and {len(palette)}"
+                    )
+                print(format_palette(args.image, palette))
+                await command_color(ip, palette[args.apply - 1].hex)
+            elif args.tui or (not args.plain and supports_tui()):
+                color = choose_palette_color(args.image, palette, ip)
+                if color is not None:
+                    await command_color(ip, color.hex)
+            else:
+                print(format_palette(args.image, palette))
         elif args.command == "brightness":
             await command_brightness(ip, args.value)
         elif args.command == "kelvin":
@@ -119,7 +161,7 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
     except OSError as exc:
         die(f"network error: {exc}")
         return 1
-    except ValueError as exc:
+    except (PaletteError, PaletteTuiError, ValueError) as exc:
         die(str(exc))
         return 1
     except RuntimeError as exc:
