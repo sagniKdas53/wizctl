@@ -11,10 +11,17 @@ import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from typing import Any, Callable, Dict, List, Optional, Tuple
+import urllib.parse
 
 from PIL import Image
 from pywizlight import PilotBuilder, SCENES, wizlight
 from pywizlight.exceptions import WizLightConnectionError, WizLightTimeOutError
+
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    HAS_TKDND = True
+except (ImportError, RuntimeError, Exception):
+    HAS_TKDND = False
 
 from wizctl import __version__
 from wizctl.bulb import DEFAULT_BULB_IP, get_bulb, get_status_info
@@ -95,6 +102,46 @@ def pil_to_photo_image(img: Image.Image) -> tk.PhotoImage:
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return tk.PhotoImage(data=buf.getvalue())
+
+
+def parse_dropped_paths(data: str, root_tk: Optional[Any] = None) -> List[str]:
+    """Cleanly parse raw drag & drop data into a list of valid filesystem paths."""
+    if not data:
+        return []
+
+    items = []
+    if root_tk and hasattr(root_tk, "splitlist"):
+        try:
+            items = list(root_tk.splitlist(data))
+        except Exception:
+            items = []
+
+    if not items:
+        raw_lines = data.strip().splitlines()
+        for line in raw_lines:
+            line = line.strip()
+            if line:
+                items.append(line)
+
+    if not items and data.strip():
+        items = [data.strip()]
+
+    results = []
+    for item in items:
+        cleaned = item.strip().strip("\"'{} \t\r\n")
+        # Handle file:// URI
+        if cleaned.startswith("file://"):
+            parsed = urllib.parse.urlparse(cleaned)
+            cleaned = urllib.parse.unquote(parsed.path)
+            if os.name == "nt" and cleaned.startswith("/") and len(cleaned) > 2 and cleaned[2] == ":":
+                cleaned = cleaned[1:]
+        elif cleaned.startswith("//") and not cleaned.startswith("///"):
+            cleaned = "/" + cleaned.lstrip("/")
+
+        if cleaned:
+            results.append(cleaned)
+
+    return results
 
 
 class ColorWheelCanvas(tk.Canvas):
@@ -272,8 +319,9 @@ class WizctlGUI:
         self._current_palette: List[PaletteColor] = []
 
         self._build_ui()
+        self._setup_dnd()
 
-        # Setup clipboard & drag-drop paste bindings
+        # Setup clipboard paste bindings
         self.root.bind("<Control-v>", self._on_paste_event)
         self.root.bind("<Control-V>", self._on_paste_event)
 
@@ -283,6 +331,51 @@ class WizctlGUI:
         # Initial ping to detect bulb status immediately
         self.root.after(100, self.ping_bulb)
         self._schedule_auto_ping()
+
+    def _setup_dnd(self):
+        """Register OS drag and drop handlers if available."""
+        if hasattr(self.root, "drop_target_register"):
+            try:
+                self.root.drop_target_register(DND_FILES)
+                self.root.dnd_bind("<<Drop>>", self._on_drop_event)
+                self.root.dnd_bind("<<DropEnter>>", self._on_drag_enter)
+                self.root.dnd_bind("<<DropLeave>>", self._on_drag_leave)
+            except Exception:
+                pass
+
+        if hasattr(self, "drop_card") and hasattr(self.drop_card, "drop_target_register"):
+            try:
+                self.drop_card.drop_target_register(DND_FILES)
+                self.drop_card.dnd_bind("<<Drop>>", self._on_drop_event)
+                self.drop_card.dnd_bind("<<DropEnter>>", self._on_drag_enter)
+                self.drop_card.dnd_bind("<<DropLeave>>", self._on_drag_leave)
+            except Exception:
+                pass
+
+    def _on_drag_enter(self, event):
+        if hasattr(self, "drop_card"):
+            self.drop_card.config(bg=CARD_HOVER, relief=tk.SOLID, bd=2)
+        return getattr(event, "action", None)
+
+    def _on_drag_leave(self, event):
+        if hasattr(self, "drop_card"):
+            self.drop_card.config(bg=INPUT_BG, relief=tk.GROOVE, bd=1)
+        return getattr(event, "action", None)
+
+    def _on_drop_event(self, event):
+        self._on_drag_leave(event)
+        data = getattr(event, "data", "")
+        paths = parse_dropped_paths(data, getattr(self.root, "tk", None))
+        if not paths:
+            self._log_activity("No valid file path detected in drop", is_error=True)
+            return
+
+        for p in paths:
+            if os.path.isfile(p):
+                self.load_image_palette(p)
+                return
+
+        self._log_activity(f"Dropped file not found: {paths[0]}", is_error=True)
 
     def _build_ui(self):
         """Construct all UI components."""
@@ -747,7 +840,7 @@ class WizctlGUI:
 
         self.img_details_label = tk.Label(
             self.img_info_frame,
-            text="No image loaded. Select an image (PNG, JPG, WebP) to extract colors.",
+            text="No image loaded. Drag & drop or select an image to extract colors.",
             font=("Helvetica", 8),
             bg=CARD_BG,
             fg=TEXT_MUTED,
@@ -791,10 +884,11 @@ class WizctlGUI:
         try:
             clipboard = self.root.clipboard_get().strip()
             if clipboard:
-                # Strip file:// or quotes
-                path_str = clipboard.replace("file://", "").strip("\"'")
-                if os.path.isfile(path_str):
-                    self.load_image_palette(path_str)
+                paths = parse_dropped_paths(clipboard, getattr(self.root, "tk", None))
+                for p in paths:
+                    if os.path.isfile(p):
+                        self.load_image_palette(p)
+                        return
         except Exception:
             pass
 
@@ -1254,7 +1348,14 @@ class WizctlGUI:
 
 def run_gui(target_ip: Optional[str] = None) -> int:
     """Launch the Tkinter GUI application."""
-    root = tk.Tk()
+    if HAS_TKDND:
+        try:
+            root = TkinterDnD.Tk()
+        except Exception:
+            root = tk.Tk()
+    else:
+        root = tk.Tk()
+
     app = WizctlGUI(root, target_ip=target_ip)
     try:
         root.mainloop()

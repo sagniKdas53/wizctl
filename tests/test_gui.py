@@ -242,3 +242,37 @@ def test_gui_palette_picker_missing_image(tk_root, tmp_path):
             app._on_close()
 
 
+def test_parse_dropped_paths(tmp_path):
+    from wizctl.gui import parse_dropped_paths
+
+    assert parse_dropped_paths("") == []
+    assert parse_dropped_paths("/home/user/photo.jpg") == ["/home/user/photo.jpg"]
+    assert parse_dropped_paths("//home/user/photo.jpg") == ["/home/user/photo.jpg"]
+    assert parse_dropped_paths("file:///home/user/my%20photo.png") == ["/home/user/my photo.png"]
+    assert parse_dropped_paths("{/home/user/my photo.png}") == ["/home/user/my photo.png"]
+
+
+def test_gui_drag_and_drop_event(tk_root, tmp_path):
+    mock_state_file = tmp_path / "state.json"
+    with patch("wizctl.state.get_state_file_path", return_value=mock_state_file):
+        with patch.object(WizctlGUI, "ping_bulb"):
+            app = WizctlGUI(tk_root, target_ip="192.168.1.100")
+
+            from PIL import Image
+            test_img_path = tmp_path / "dropped.png"
+            img = Image.new("RGB", (60, 60), color=(0, 200, 100))
+            img.save(test_img_path)
+
+            class MockDropEvent:
+                data = str(test_img_path)
+                action = "copy"
+
+            app._on_drop_event(MockDropEvent())
+
+            assert app._current_image_path == str(test_img_path)
+            assert len(app._current_palette) > 0
+
+            app._on_close()
+
+
+

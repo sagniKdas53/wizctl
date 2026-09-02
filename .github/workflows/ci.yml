@@ -70,14 +70,14 @@ jobs:
       - name: Build standalone executable (Linux / macOS)
         if: matrix.build && matrix.os != 'windows-latest'
         run: |
-          python -m PyInstaller --onefile --clean --name wizctl --paths src src/wizctl/__main__.py
+          python -m PyInstaller --onefile --clean --name wizctl --collect-all tkinterdnd2 --paths src src/wizctl/__main__.py
           ./dist/wizctl --help
           ./dist/wizctl scenes
 
       - name: Build standalone executable (Windows)
         if: matrix.build && matrix.os == 'windows-latest'
         run: |
-          python -m PyInstaller --onefile --clean --name wizctl --paths src src/wizctl/__main__.py
+          python -m PyInstaller --onefile --clean --name wizctl --collect-all tkinterdnd2 --paths src src/wizctl/__main__.py
           .\dist\wizctl.exe --help
           .\dist\wizctl.exe scenes
 

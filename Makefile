@@ -36,7 +36,7 @@ build:
 	$(VENV_BIN)/python -m build
 
 binary:
-	$(VENV_BIN)/pyinstaller --onefile --clean --name wizctl --paths src src/wizctl/__main__.py
+	$(VENV_BIN)/pyinstaller --onefile --clean --name wizctl --collect-all tkinterdnd2 --paths src src/wizctl/__main__.py
 
 palette:
 	@test -n "$(IMAGE)" || (echo "Set IMAGE to an image path, for example: make palette IMAGE=photo.jpg"; exit 2)
