@@ -3,19 +3,20 @@
 import asyncio
 from contextlib import asynccontextmanager
 import os
-from typing import AsyncGenerator, Dict, Optional, Tuple
+from typing import AsyncGenerator, Dict, Optional, Tuple, Union
 
 from pywizlight import PilotBuilder, SCENES, wizlight
 
-from wizctl.parsers import parse_brightness, parse_color, parse_scene
+from wizctl.parsers import parse_brightness, parse_color, parse_kelvin, parse_scene, validate_ip
 
 DEFAULT_BULB_IP = os.environ.get("WIZ_IP", os.environ.get("BULB_IP", "192.168.0.102"))
 
 
 @asynccontextmanager
 async def get_bulb(ip: str) -> AsyncGenerator[wizlight, None]:
-    """Context manager to ensure proper cleanup of wizlight connection."""
-    bulb = wizlight(ip)
+    """Context manager to ensure proper cleanup of wizlight connection with IP validation."""
+    clean_ip = validate_ip(ip)
+    bulb = wizlight(clean_ip)
     try:
         yield bulb
     finally:
@@ -116,9 +117,15 @@ async def command_toggle(ip: str) -> bool:
             return True
 
 
-async def command_color(ip: str, value: str) -> Tuple[int, int, int]:
-    """Set the bulb RGB color."""
-    rgb = parse_color(value)
+async def command_color(ip: str, value: Union[str, Tuple[int, int, int]]) -> Tuple[int, int, int]:
+    """Set the bulb RGB color safely."""
+    if isinstance(value, (tuple, list)):
+        if len(value) != 3 or not all(isinstance(x, int) and 0 <= x <= 255 for x in value):
+            raise ValueError(f"RGB tuple must contain 3 integers in [0, 255], got {value}")
+        rgb = (int(value[0]), int(value[1]), int(value[2]))
+    else:
+        rgb = parse_color(str(value))
+
     async with get_bulb(ip) as bulb:
         await bulb.turn_on(PilotBuilder(rgb=rgb))
 
@@ -127,8 +134,8 @@ async def command_color(ip: str, value: str) -> Tuple[int, int, int]:
     return rgb
 
 
-async def command_brightness(ip: str, value: str) -> int:
-    """Set the bulb brightness."""
+async def command_brightness(ip: str, value: Union[str, int, float]) -> int:
+    """Set the bulb brightness safely (0-255)."""
     brightness = parse_brightness(value)
     async with get_bulb(ip) as bulb:
         await bulb.turn_on(PilotBuilder(brightness=brightness))
@@ -138,20 +145,18 @@ async def command_brightness(ip: str, value: str) -> int:
     return brightness
 
 
-async def command_kelvin(ip: str, value: int) -> int:
-    """Set the bulb color temperature in Kelvin."""
-    if not 1000 <= value <= 12000:
-        raise ValueError("Kelvin must be between 1000 and 12000 (typical range 2200K - 6500K)")
-
+async def command_kelvin(ip: str, value: Union[str, int, float]) -> int:
+    """Set the bulb color temperature in Kelvin (1000K-10000K)."""
+    kelvin = parse_kelvin(value)
     async with get_bulb(ip) as bulb:
-        await bulb.turn_on(PilotBuilder(colortemp=value))
+        await bulb.turn_on(PilotBuilder(colortemp=kelvin))
 
-    print(f"✓ {value}K")
-    return value
+    print(f"✓ {kelvin}K")
+    return kelvin
 
 
-async def command_scene(ip: str, value: str) -> Tuple[int, str]:
-    """Set the bulb scene by ID or name."""
+async def command_scene(ip: str, value: Union[str, int]) -> Tuple[int, str]:
+    """Set the bulb scene safely by ID or name."""
     scene_id, scene_name = parse_scene(value)
     async with get_bulb(ip) as bulb:
         await bulb.turn_on(PilotBuilder(scene=scene_id))

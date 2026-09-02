@@ -126,3 +126,22 @@ def test_command_scenes(capsys):
     captured = capsys.readouterr()
     assert "Available WiZ Scenes:" in captured.out
     assert "Sunset" in captured.out
+
+
+@pytest.mark.asyncio
+async def test_get_bulb_invalid_ip():
+    from wizctl.bulb import get_bulb
+    with pytest.raises(ValueError):
+        async with get_bulb("invalid_ip"):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_command_color_tuple(mock_wizlight, capsys):
+    with patch("wizctl.bulb.wizlight", return_value=mock_wizlight):
+        rgb = await command_color("192.168.0.102", (255, 128, 0))
+        assert rgb == (255, 128, 0)
+        assert mock_wizlight.turn_on.called
+        captured = capsys.readouterr()
+        assert "✓ RGB(255, 128, 0)" in captured.out
+

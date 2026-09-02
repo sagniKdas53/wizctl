@@ -198,3 +198,84 @@ class TestSceneParser:
     def test_invalid_scenes(self, invalid_scene):
         with pytest.raises(ValueError):
             parse_scene(invalid_scene)
+
+
+class TestValidateIP:
+    """Test validate_ip function."""
+
+    @pytest.mark.parametrize(
+        "valid_ip,expected",
+        [
+            ("192.168.0.102", "192.168.0.102"),
+            ("10.0.0.1", "10.0.0.1"),
+            ("172.16.0.50", "172.16.0.50"),
+            ("  192.168.1.1  ", "192.168.1.1"),
+        ],
+    )
+    def test_valid_ips(self, valid_ip, expected):
+        from wizctl.parsers import validate_ip
+        assert validate_ip(valid_ip) == expected
+
+    @pytest.mark.parametrize(
+        "invalid_ip",
+        [
+            "",
+            "   ",
+            "not_an_ip",
+            "999.999.999.999",
+            "192.168.1.256",
+            "255.255.255.255",  # Global broadcast
+            "224.0.0.1",        # Multicast
+            "::1",              # IPv6
+            12345,
+            None,
+        ],
+    )
+    def test_invalid_ips(self, invalid_ip):
+        from wizctl.parsers import validate_ip
+        with pytest.raises(ValueError):
+            validate_ip(invalid_ip)
+
+
+class TestKelvinParser:
+    """Test parse_kelvin function."""
+
+    @pytest.mark.parametrize(
+        "kelvin_input,expected",
+        [
+            ("2700", 2700),
+            ("2700K", 2700),
+            ("2700k", 2700),
+            (" 4000 K ", 4000),
+            ("6500", 6500),
+            (2700, 2700),
+            (2200.0, 2200),
+            (1000, 1000),
+            (10000, 10000),
+        ],
+    )
+    def test_valid_kelvin(self, kelvin_input, expected):
+        from wizctl.parsers import parse_kelvin
+        assert parse_kelvin(kelvin_input) == expected
+
+    @pytest.mark.parametrize(
+        "invalid_kelvin",
+        [
+            "",
+            "   ",
+            "abc",
+            "999",     # Below 1000K
+            "10001",   # Above 10000K
+            "-500",
+            0,
+            float("nan"),
+            float("inf"),
+            None,
+            [],
+        ],
+    )
+    def test_invalid_kelvin(self, invalid_kelvin):
+        from wizctl.parsers import parse_kelvin
+        with pytest.raises(ValueError):
+            parse_kelvin(invalid_kelvin)
+

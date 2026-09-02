@@ -60,10 +60,17 @@ class TestCLIParser:
         args = parser.parse_args(["scenes"])
         assert args.command == "scenes"
 
-    def test_parser_missing_command_raises(self):
+    def test_parser_no_command_defaults_to_none(self):
         parser = create_parser()
-        with pytest.raises(SystemExit):
-            parser.parse_args([])
+        args = parser.parse_args([])
+        assert args.command is None
+        assert args.ip == "192.168.0.102"
+
+    def test_parser_gui_command(self):
+        parser = create_parser()
+        args = parser.parse_args(["gui"])
+        assert args.command == "gui"
+        assert args.ip == "192.168.0.102"
 
     def test_parser_invalid_command_raises(self):
         parser = create_parser()
@@ -81,3 +88,18 @@ class TestCLIMain:
         assert "Available WiZ Scenes:" in captured.out
         assert "Cozy" in captured.out
         assert "Sunset" in captured.out
+
+    def test_main_gui_default(self, monkeypatch):
+        called_with_ip = []
+        monkeypatch.setattr("wizctl.gui.run_gui", lambda target_ip=None: called_with_ip.append(target_ip) or 0)
+        exit_code = main([])
+        assert exit_code == 0
+        assert called_with_ip == ["192.168.0.102"]
+
+    def test_main_gui_subcommand(self, monkeypatch):
+        called_with_ip = []
+        monkeypatch.setattr("wizctl.gui.run_gui", lambda target_ip=None: called_with_ip.append(target_ip) or 0)
+        exit_code = main(["--ip", "192.168.1.99", "gui"])
+        assert exit_code == 0
+        assert called_with_ip == ["192.168.1.99"]
+

@@ -46,9 +46,10 @@ def create_parser() -> argparse.ArgumentParser:
 
     sub = parser.add_subparsers(
         dest="command",
-        required=True,
+        required=False,
     )
 
+    sub.add_parser("gui", help="open the graphical control panel (default)")
     sub.add_parser("on", help="turn the bulb on")
     sub.add_parser("off", help="turn the bulb off")
     sub.add_parser("toggle", help="toggle bulb power state")
@@ -116,6 +117,10 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
 
     ip = args.ip
 
+    if args.command is None or args.command == "gui":
+        from wizctl.gui import run_gui
+        return run_gui(target_ip=ip)
+
     try:
         if args.command == "on":
             await command_on(ip)
@@ -177,6 +182,11 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
 def main(argv: Optional[List[str]] = None) -> int:
     """Synchronous CLI entry point returning exit code."""
     try:
+        parser = create_parser()
+        args = parser.parse_args(argv)
+        if args.command is None or args.command == "gui":
+            from wizctl.gui import run_gui
+            return run_gui(target_ip=args.ip)
         return asyncio.run(async_main(argv))
     except KeyboardInterrupt:
         return 130
