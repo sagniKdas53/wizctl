@@ -91,6 +91,7 @@ wizctl --ip 192.168.1.50 gui
 
 The GUI includes:
 - **Interactive HSV Color Wheel**: Click & drag on the wheel to manipulate colors with smooth real-time visual feedback and debounced network commands.
+- **Image Palette Picker**: Drag and drop an image file or click "Select Image..." to automatically extract dominant color swatches, view dominance percentages, and click any swatch to apply it directly to the bulb.
 - **State Memory**: Persists your last known IP, power, brightness, RGB, Kelvin, and custom recent palette colors across sessions.
 - **Live Bulb Pinging**: Pings the bulb on startup, on IP edit, and periodically in the background to show live power state, latency (ms), RSSI signal strength (dBm), and MAC address.
 - **One-Click Power Toggle**: Large toggle button showing live bulb power state.

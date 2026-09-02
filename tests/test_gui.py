@@ -200,3 +200,45 @@ def test_gui_scene_and_power_toggle(tk_root, tmp_path):
 
             app._on_close()
 
+
+def test_gui_palette_picker_load_image(tk_root, tmp_path):
+    mock_state_file = tmp_path / "state.json"
+    with patch("wizctl.state.get_state_file_path", return_value=mock_state_file):
+        with patch.object(WizctlGUI, "ping_bulb"):
+            app = WizctlGUI(tk_root, target_ip="192.168.1.100")
+
+            # Create a simple test image
+            from PIL import Image
+            test_img_path = tmp_path / "test.png"
+            img = Image.new("RGB", (100, 100), color=(255, 0, 128))
+            img.save(test_img_path)
+
+            app.load_image_palette(str(test_img_path), colors=4)
+
+            assert len(app._current_palette) > 0
+            assert app._current_image_path == str(test_img_path)
+            assert len(app.palette_swatches_frame.winfo_children()) == len(app._current_palette)
+
+            # Test clicking a swatch
+            first_color = app._current_palette[0]
+            with patch.object(app, "_send_color") as mock_send:
+                app._on_palette_swatch_click(first_color)
+                assert app.state["hex"] == first_color.hex
+                assert first_color.hex in app.state["recent_colors"]
+                assert mock_send.called
+
+            app._on_close()
+
+
+def test_gui_palette_picker_missing_image(tk_root, tmp_path):
+    mock_state_file = tmp_path / "state.json"
+    with patch("wizctl.state.get_state_file_path", return_value=mock_state_file):
+        with patch.object(WizctlGUI, "ping_bulb"):
+            app = WizctlGUI(tk_root, target_ip="192.168.1.100")
+
+            app.load_image_palette(str(tmp_path / "non_existent.jpg"))
+            assert "Image not found" in app.activity_bar.cget("text")
+
+            app._on_close()
+
+

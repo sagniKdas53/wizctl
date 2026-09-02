@@ -5,10 +5,11 @@ import colorsys
 import io
 import math
 import os
+from pathlib import Path
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import filedialog, messagebox, ttk
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from PIL import Image
@@ -17,6 +18,7 @@ from pywizlight.exceptions import WizLightConnectionError, WizLightTimeOutError
 
 from wizctl import __version__
 from wizctl.bulb import DEFAULT_BULB_IP, get_bulb, get_status_info
+from wizctl.palette import PaletteColor, PaletteError, extract_palette
 from wizctl.parsers import parse_brightness, parse_color, parse_kelvin, validate_ip
 from wizctl.state import DEFAULT_PRESET_COLORS, load_state, save_state
 
@@ -240,8 +242,8 @@ class WizctlGUI:
     def __init__(self, root: tk.Tk, target_ip: Optional[str] = None):
         self.root = root
         self.root.title("WiZ Controller - wizctl")
-        self.root.geometry("490x750")
-        self.root.minsize(450, 700)
+        self.root.geometry("500x780")
+        self.root.minsize(460, 720)
         self.root.configure(bg=BG_DARK)
 
         # Load persisted state
@@ -263,7 +265,17 @@ class WizctlGUI:
         self.is_pinging = False
         self._auto_ping_job = None
 
+        # Image Palette State
+        self._current_image_path: Optional[str] = None
+        self._palette_colors_count: int = 8
+        self._palette_thumb_img: Optional[tk.PhotoImage] = None
+        self._current_palette: List[PaletteColor] = []
+
         self._build_ui()
+
+        # Setup clipboard & drag-drop paste bindings
+        self.root.bind("<Control-v>", self._on_paste_event)
+        self.root.bind("<Control-V>", self._on_paste_event)
 
         # Auto-save state on close
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -274,8 +286,7 @@ class WizctlGUI:
 
     def _build_ui(self):
         """Construct all UI components."""
-        # Main container with scroll or clean padding
-        main_frame = tk.Frame(self.root, bg=BG_DARK, padx=16, pady=14)
+        main_frame = tk.Frame(self.root, bg=BG_DARK, padx=16, pady=12)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
         # --- 1. Top Header & Connection Card ---
@@ -430,7 +441,7 @@ class WizctlGUI:
             )
             btn.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
 
-        # --- 4. Control Modes Notebook / Tabs (Color Wheel / Kelvin / Scenes) ---
+        # --- 4. Control Modes Notebook / Tabs ---
         style = ttk.Style()
         style.theme_use("default")
         style.configure(
@@ -442,7 +453,7 @@ class WizctlGUI:
             "TNotebook.Tab",
             background=CARD_BG,
             foreground=TEXT_SECONDARY,
-            padding=[12, 6],
+            padding=[10, 6],
             font=("Helvetica", 9, "bold"),
             borderwidth=0,
         )
@@ -599,7 +610,6 @@ class WizctlGUI:
         self.kelvin_slider.pack(fill=tk.X, pady=(4, 10))
         self.kelvin_slider.bind("<ButtonRelease-1>", lambda e: self._on_kelvin_release())
 
-        # Kelvin Presets
         k_presets_label = tk.Label(
             tab_kelvin,
             text="Temperature Presets:",
@@ -664,6 +674,9 @@ class WizctlGUI:
         for c in range(3):
             scenes_grid.grid_columnconfigure(c, weight=1)
 
+        # Tab 4: Image Palette Picker
+        self._build_palette_tab()
+
         # Restore initial RGB on wheel widget
         if "rgb" in self.state:
             self.color_wheel.set_rgb(tuple(self.state["rgb"]), notify=False)
@@ -678,6 +691,225 @@ class WizctlGUI:
             anchor="w",
         )
         self.activity_bar.pack(fill=tk.X, pady=(4, 0))
+
+    def _build_palette_tab(self):
+        """Build the interactive Image Palette Picker tab."""
+        self.tab_palette = tk.Frame(self.notebook, bg=CARD_BG, padx=10, pady=10)
+        self.notebook.add(self.tab_palette, text="🖼️ Palette")
+
+        # Drop Zone / File Selection Card
+        self.drop_card = tk.Frame(
+            self.tab_palette,
+            bg=INPUT_BG,
+            bd=1,
+            relief=tk.GROOVE,
+            padx=10,
+            pady=10,
+            cursor="hand2",
+        )
+        self.drop_card.pack(fill=tk.X, pady=(0, 8))
+        self.drop_card.bind("<Button-1>", lambda e: self._browse_image())
+
+        drop_header = tk.Frame(self.drop_card, bg=INPUT_BG)
+        drop_header.pack(fill=tk.X)
+
+        self.drop_icon_label = tk.Label(
+            drop_header,
+            text="🖼️ Drag & drop image here or click 'Select Image...'",
+            font=("Helvetica", 9, "bold"),
+            bg=INPUT_BG,
+            fg=TEXT_PRIMARY,
+        )
+        self.drop_icon_label.pack(side=tk.LEFT, fill=tk.X, expand=True, anchor="w")
+        self.drop_icon_label.bind("<Button-1>", lambda e: self._browse_image())
+
+        self.browse_btn = tk.Button(
+            drop_header,
+            text="📁 Select Image...",
+            font=("Helvetica", 8, "bold"),
+            bg=ACCENT_BLUE,
+            fg="#ffffff",
+            activebackground="#2563eb",
+            bd=0,
+            padx=8,
+            pady=3,
+            cursor="hand2",
+            command=self._browse_image,
+        )
+        self.browse_btn.pack(side=tk.RIGHT)
+
+        # Image Info and Preview Frame
+        self.img_info_frame = tk.Frame(self.tab_palette, bg=CARD_BG)
+        self.img_info_frame.pack(fill=tk.X, pady=(0, 6))
+
+        self.thumb_label = tk.Label(self.img_info_frame, bg=CARD_BG)
+        self.thumb_label.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.img_details_label = tk.Label(
+            self.img_info_frame,
+            text="No image loaded. Select an image (PNG, JPG, WebP) to extract colors.",
+            font=("Helvetica", 8),
+            bg=CARD_BG,
+            fg=TEXT_MUTED,
+            justify=tk.LEFT,
+            anchor="w",
+        )
+        self.img_details_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # Swatches Container (Scrollable or Clean Grid)
+        self.swatches_title = tk.Label(
+            self.tab_palette,
+            text="Extracted Color Palette (Click to Apply):",
+            font=("Helvetica", 8, "bold"),
+            bg=CARD_BG,
+            fg=TEXT_MUTED,
+            anchor="w",
+        )
+        self.swatches_title.pack(fill=tk.X, pady=(4, 4))
+
+        self.palette_swatches_frame = tk.Frame(self.tab_palette, bg=CARD_BG)
+        self.palette_swatches_frame.pack(fill=tk.BOTH, expand=True)
+
+    def _browse_image(self):
+        """Open native file dialog to choose an image file."""
+        filetypes = [
+            (
+                "Image Files",
+                "*.jpg *.jpeg *.png *.webp *.bmp *.gif *.tiff *.JPG *.PNG *.JPEG *.WEBP",
+            ),
+            ("All Files", "*.*"),
+        ]
+        chosen = filedialog.askopenfilename(
+            title="Select Image to Extract Color Palette",
+            filetypes=filetypes,
+        )
+        if chosen:
+            self.load_image_palette(chosen)
+
+    def _on_paste_event(self, event):
+        """Handle clipboard paste of file path."""
+        try:
+            clipboard = self.root.clipboard_get().strip()
+            if clipboard:
+                # Strip file:// or quotes
+                path_str = clipboard.replace("file://", "").strip("\"'")
+                if os.path.isfile(path_str):
+                    self.load_image_palette(path_str)
+        except Exception:
+            pass
+
+    def load_image_palette(self, image_path: str, colors: Optional[int] = None):
+        """Extract dominant colors from an image file and display the palette in GUI."""
+        if colors is None:
+            colors = self._palette_colors_count
+
+        path = Path(image_path)
+        if not path.is_file():
+            self._log_activity(f"Image not found: {image_path}", is_error=True)
+            return
+
+        try:
+            palette = extract_palette(str(path), colors=colors)
+            self._current_palette = palette
+            self._current_image_path = str(path)
+
+            # Generate Thumbnail
+            with Image.open(path) as img:
+                w, h = img.size
+                thumb = img.copy()
+                thumb.thumbnail((64, 64))
+                self._thumb_photo = pil_to_photo_image(thumb)
+                self.thumb_label.config(image=self._thumb_photo)
+
+            self.img_details_label.config(
+                text=f"📄 {path.name}\nResolution: {w} × {h} px\nColors extracted: {len(palette)}",
+                fg=TEXT_PRIMARY,
+            )
+
+            # Render swatches
+            self._render_palette_swatches(palette)
+
+            # Switch notebook to Palette tab
+            self.notebook.select(self.tab_palette)
+            self._log_activity(f"✓ Extracted {len(palette)} colors from {path.name}")
+
+        except (PaletteError, Exception) as exc:
+            self._log_activity(f"Error reading image palette: {exc}", is_error=True)
+            messagebox.showerror("Palette Extraction Error", str(exc))
+
+    def _render_palette_swatches(self, palette: List[PaletteColor]):
+        """Render interactive swatch cards for extracted palette colors."""
+        for widget in self.palette_swatches_frame.winfo_children():
+            widget.destroy()
+
+        cols = 2
+        for idx, color in enumerate(palette):
+            row = idx // cols
+            col = idx % cols
+
+            card = tk.Frame(
+                self.palette_swatches_frame,
+                bg=INPUT_BG,
+                bd=1,
+                relief=tk.FLAT,
+                padx=8,
+                pady=6,
+                cursor="hand2",
+            )
+            card.grid(row=row, column=col, sticky="nsew", padx=3, pady=3)
+
+            # Color preview square
+            swatch_box = tk.Frame(
+                card,
+                bg=color.hex,
+                width=28,
+                height=28,
+                bd=1,
+                relief=tk.SOLID,
+            )
+            swatch_box.pack(side=tk.LEFT, padx=(0, 8))
+
+            # Info labels
+            info_frame = tk.Frame(card, bg=INPUT_BG)
+            info_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+            hex_txt = tk.Label(
+                info_frame,
+                text=color.hex.upper(),
+                font=("Monospace", 9, "bold"),
+                bg=INPUT_BG,
+                fg=TEXT_PRIMARY,
+                anchor="w",
+            )
+            hex_txt.pack(fill=tk.X)
+
+            pct_txt = tk.Label(
+                info_frame,
+                text=f"{color.percentage:.1f}% dominance",
+                font=("Monospace", 8),
+                bg=INPUT_BG,
+                fg=TEXT_MUTED,
+                anchor="w",
+            )
+            pct_txt.pack(fill=tk.X)
+
+            # Click handler to apply this color
+            def _make_handler(c=color):
+                return lambda e: self._on_palette_swatch_click(c)
+
+            card.bind("<Button-1>", _make_handler())
+            swatch_box.bind("<Button-1>", _make_handler())
+            hex_txt.bind("<Button-1>", _make_handler())
+            pct_txt.bind("<Button-1>", _make_handler())
+            info_frame.bind("<Button-1>", _make_handler())
+
+        for c in range(cols):
+            self.palette_swatches_frame.grid_columnconfigure(c, weight=1)
+
+    def _on_palette_swatch_click(self, color: PaletteColor):
+        """Handle user clicking a palette color swatch."""
+        self.set_color_hex(color.hex)
+        self._log_activity(f"✓ Applied image palette color {color.hex} ({color.percentage:.1f}%)")
 
     def _get_current_ip(self) -> str:
         """Get IP from entry field, validated and trimmed."""
@@ -787,7 +1019,6 @@ class WizctlGUI:
     def _schedule_auto_ping(self):
         """Background periodic ping to maintain live bulb state."""
         self.ping_bulb()
-        # Schedule next ping in 10 seconds
         self._auto_ping_job = self.root.after(10000, self._schedule_auto_ping)
 
     def _update_power_button_ui(self, power: bool):
@@ -839,7 +1070,6 @@ class WizctlGUI:
         self.state["rgb"] = list(rgb)
         self.state["hex"] = hex_code
 
-        # Throttle network command during drag
         now = time.time()
         if now - self._last_send_time >= self._throttle_interval:
             self._last_send_time = now
