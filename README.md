@@ -16,7 +16,8 @@ A fast, lightweight CLI tool and Python library for controlling WiZ Connected sm
 - **Flexible Color Input**: Supports named colors (`warmwhite`, `red`, `cyan`, etc.), 6-digit hex (`#ff5500`), shorthand 3-digit hex (`#f50`), and RGB triples (`255, 128, 0`).
 - **Image palettes**: Extract dominant colors from a photo, then copy a ready-made `wizctl color` command or set a swatch directly.
 - **Scene Presets**: Switch scenes by name (`cozy`, `sunset`, `ocean`, `candlelight`) or ID (`1`-`36`, `40`), and list all scenes with `wizctl scenes`.
-- **Standalone Binary**: Includes a standalone compiled binary executable with zero external runtime dependencies.
+- **WiZclick & Favorites**: Inspect and trigger your physical wall switch settings (Mode 1: Cozy, Mode 2: Night light) directly via CLI (`wizctl wizclick [1|2]`) or with one-click buttons in the GUI.
+- **Live State Reconciliation**: Protects against stale state collisions. When someone flips the wall switch (WiZclick), changes settings in the official mobile app, or an automation (schedules, circadian rhythm, SpaceSense) updates the bulb, `wizctl` verifies live hardware status before modifying power or applying changes to prevent clobbering external state.
 - **Robust Error Handling**: Automatic UDP transport cleanup, timeout detection, and device reachability checks.
 
 ---
@@ -136,6 +137,11 @@ wizctl kelvin 4000
 wizctl scene cozy
 wizctl scene sunset
 wizctl scene 1
+
+# Inspect WiZclick wall switch modes or trigger Mode 1 (Cozy) / Mode 2 (Night light)
+wizctl wizclick
+wizctl wizclick 1
+wizctl wizclick 2
 
 # List all available WiZ scenes
 wizctl scenes

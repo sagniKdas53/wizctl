@@ -3,7 +3,7 @@
 import asyncio
 from contextlib import asynccontextmanager
 import os
-from typing import AsyncGenerator, Dict, Optional, Tuple, Union
+from typing import AsyncGenerator, Dict, List, Optional, Tuple, Union
 
 from pywizlight import PilotBuilder, SCENES, wizlight
 
@@ -23,6 +23,30 @@ async def get_bulb(ip: str) -> AsyncGenerator[wizlight, None]:
         await bulb.async_close()
 
 
+async def get_favorites(ip: str) -> List[Dict]:
+    """Fetch WiZclick favorite modes from the bulb."""
+    async with get_bulb(ip) as bulb:
+        try:
+            resp = await bulb.send({"method": "getFavs", "params": {}})
+            favs_raw = resp.get("result", {}).get("favs", []) if isinstance(resp, dict) else []
+            favorites = []
+            for idx, fav in enumerate(favs_raw):
+                if isinstance(fav, (list, tuple)) and len(fav) > 0:
+                    sid = fav[0]
+                elif isinstance(fav, int):
+                    sid = fav
+                else:
+                    continue
+                favorites.append({
+                    "mode": idx + 1,
+                    "scene_id": sid,
+                    "scene_name": SCENES.get(sid, f"Scene {sid}") if sid else "None",
+                })
+            return favorites
+        except Exception:
+            return []
+
+
 async def get_status_info(ip: str) -> Dict:
     """Fetch status dictionary from the bulb."""
     async with get_bulb(ip) as bulb:
@@ -34,6 +58,27 @@ async def get_status_info(ip: str) -> Dict:
         rgb = state.get_rgb()
         has_rgb = rgb is not None and rgb[0] is not None
 
+        favorites = []
+        try:
+            resp = await bulb.send({"method": "getFavs", "params": {}})
+            favs_raw = resp.get("result", {}).get("favs", []) if isinstance(resp, dict) else []
+            for idx, fav in enumerate(favs_raw):
+                if isinstance(fav, (list, tuple)) and len(fav) > 0:
+                    sid = fav[0]
+                elif isinstance(fav, int):
+                    sid = fav
+                else:
+                    continue
+                favorites.append({
+                    "mode": idx + 1,
+                    "scene_id": sid,
+                    "scene_name": SCENES.get(sid, f"Scene {sid}") if sid else "None",
+                })
+        except Exception:
+            pass
+
+        source = state.get_source() if hasattr(state, "get_source") else state.pilotResult.get("src")
+
         return {
             "ip": ip,
             "mac": state.get_mac(),
@@ -44,6 +89,8 @@ async def get_status_info(ip: str) -> Dict:
             "scene_id": state.get_scene_id(),
             "rgb": rgb if has_rgb else None,
             "colortemp": state.get_colortemp(),
+            "source": source,
+            "favorites": favorites,
             "raw": state.pilotResult,
         }
 
@@ -84,6 +131,44 @@ async def command_status(ip: str) -> None:
     kelvin = info["colortemp"]
     if kelvin:
         print(f"Kelvin:     {kelvin}K")
+
+    if info.get("source"):
+        print(f"Source:     {info['source']}")
+
+    favorites = info.get("favorites")
+    if favorites:
+        fav_strs = [f"Mode {f['mode']}: {f['scene_name']}" for f in favorites]
+        print(f"WiZclick:   {' | '.join(fav_strs)}")
+
+
+async def command_wizclick(ip: str, mode: Optional[int] = None) -> Tuple[int, str]:
+    """Show or activate WiZclick favorite modes."""
+    favorites = await get_favorites(ip)
+    if not favorites:
+        favorites = [
+            {"mode": 1, "scene_id": 6, "scene_name": "Cozy"},
+            {"mode": 2, "scene_id": 14, "scene_name": "Night light"},
+        ]
+
+    if mode is not None:
+        matched = next((f for f in favorites if f["mode"] == mode), None)
+        if not matched:
+            raise ValueError(f"WiZclick mode must be between 1 and {len(favorites)}, got {mode}")
+        sid = matched["scene_id"]
+        sname = matched["scene_name"]
+        async with get_bulb(ip) as bulb:
+            await bulb.turn_on(PilotBuilder(scene=sid))
+        print(f"✓ WiZclick Mode {mode} ({sname})")
+        return sid, sname
+
+    print("WiZclick Settings (Wall Switch Modes):")
+    print("-" * 40)
+    for fav in favorites:
+        print(f"  Mode {fav['mode']} (Click {fav['mode']}): {fav['scene_name']} (Scene ID: {fav['scene_id']})")
+    print("-" * 40)
+    print("Toggle physical wall switch once for Mode 1, twice quickly for Mode 2.")
+    print("Usage: wizctl wizclick [1|2]")
+    return 0, ""
 
 
 async def command_on(ip: str) -> None:

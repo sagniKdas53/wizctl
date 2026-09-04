@@ -53,6 +53,9 @@ class MockPilotParser:
     def get_colortemp(self) -> Optional[int]:
         return self.pilotResult.get("temp")
 
+    def get_source(self) -> Optional[str]:
+        return self.pilotResult.get("src")
+
 
 @pytest.fixture
 def mock_pilot_parser():
@@ -68,6 +71,12 @@ def mock_wizlight(mock_pilot_parser):
     bulb.turn_on = AsyncMock()
     bulb.turn_off = AsyncMock()
     bulb.lightSwitch = AsyncMock()
+    bulb.send = AsyncMock(
+        return_value={"result": {"favs": [[6, 0, 0, 0, 0, 0, 0], [14, 0, 0, 0, 0, 0, 0]]}}
+    )
+    bulb.getUserConfig = AsyncMock(
+        return_value={"result": {"fadeIn": 450, "fadeOut": 500, "dftDim": 100, "po": False}}
+    )
     bulb.async_close = AsyncMock()
     return bulb
 

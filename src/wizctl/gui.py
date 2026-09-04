@@ -50,10 +50,10 @@ FEATURED_SCENES = [
     (1, "Ocean"),
     (29, "Candlelight"),
     (4, "Forest"),
-    (5, "Night light"),
+    (14, "Night light"),
     (2, "Romance"),
     (7, "Party"),
-    (8, "Fireplace"),
+    (5, "Fireplace"),
     (23, "Deep dive"),
     (15, "Spring"),
     (17, "Pulse"),
@@ -324,6 +324,9 @@ class WizctlGUI:
         # Setup clipboard paste bindings
         self.root.bind("<Control-v>", self._on_paste_event)
         self.root.bind("<Control-V>", self._on_paste_event)
+
+        # Refresh bulb state when window gains focus
+        self.root.bind("<FocusIn>", lambda e: self.ping_bulb() if not self.is_pinging else None)
 
         # Auto-save state on close
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -742,6 +745,60 @@ class WizctlGUI:
         tab_scenes = tk.Frame(self.notebook, bg=CARD_BG, padx=10, pady=10)
         self.notebook.add(tab_scenes, text="✨ Scenes")
 
+        # WiZclick Quick Switch (Wall switch modes 1 & 2)
+        wizclick_card = tk.Frame(tab_scenes, bg=INPUT_BG, bd=1, relief=tk.SOLID, padx=8, pady=6)
+        wizclick_card.pack(fill=tk.X, pady=(0, 8))
+
+        wc_header = tk.Frame(wizclick_card, bg=INPUT_BG)
+        wc_header.pack(fill=tk.X, pady=(0, 4))
+        tk.Label(
+            wc_header,
+            text="⚡ WiZclick (Wall Switch Settings)",
+            font=("Helvetica", 8, "bold"),
+            bg=INPUT_BG,
+            fg=ACCENT_AMBER,
+        ).pack(side=tk.LEFT)
+        tk.Label(
+            wc_header,
+            text="Switch 1x or 2x",
+            font=("Helvetica", 7),
+            bg=INPUT_BG,
+            fg=TEXT_MUTED,
+        ).pack(side=tk.RIGHT)
+
+        wc_btn_frame = tk.Frame(wizclick_card, bg=INPUT_BG)
+        wc_btn_frame.pack(fill=tk.X)
+
+        btn_cozy = tk.Button(
+            wc_btn_frame,
+            text="🛋️ Mode 1: Cozy (1st Click)",
+            font=("Helvetica", 8, "bold"),
+            bg=CARD_BG,
+            fg=TEXT_PRIMARY,
+            activebackground=CARD_HOVER,
+            bd=1,
+            padx=4,
+            pady=4,
+            cursor="hand2",
+            command=lambda: self.set_scene(6, "Cozy"),
+        )
+        btn_cozy.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
+
+        btn_night = tk.Button(
+            wc_btn_frame,
+            text="🌙 Mode 2: Night light (2nd Click)",
+            font=("Helvetica", 8, "bold"),
+            bg=CARD_BG,
+            fg=TEXT_PRIMARY,
+            activebackground=CARD_HOVER,
+            bd=1,
+            padx=4,
+            pady=4,
+            cursor="hand2",
+            command=lambda: self.set_scene(14, "Night light"),
+        )
+        btn_night.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
+
         scenes_grid = tk.Frame(tab_scenes, bg=CARD_BG)
         scenes_grid.pack(fill=tk.BOTH, expand=True)
 
@@ -1066,18 +1123,37 @@ class WizctlGUI:
         )
         self.signal_label.config(text=rssi_str)
 
+        old_power = self.state.get("power")
+        old_scene = self.state.get("scene_id")
+        old_bright = self.state.get("brightness")
+        external_changes = []
+
         # Update Power State
         power = info.get("power", True)
+        if old_power is not None and old_power != power:
+            external_changes.append(f"Power: {'ON' if power else 'OFF'}")
         self.state["power"] = power
         self._update_power_button_ui(power)
 
         # Update Brightness
         b = info.get("brightness")
         if b is not None:
+            if old_bright is not None and abs(old_bright - b) > 5 and not getattr(self, "_is_user_dragging", False):
+                pct = int(b * 100 / 255)
+                external_changes.append(f"Brightness: {pct}%")
             self.state["brightness"] = b
             pct = int(b * 100 / 255)
             self.brightness_label.config(text=f"{pct}% ({b}/255)")
             self.bright_slider.set(b)
+
+        # Update Scene
+        scene_id = info.get("scene_id")
+        scene_name = info.get("scene")
+        if scene_id is not None and scene_id != 0:
+            if old_scene is not None and old_scene != scene_id:
+                sname = scene_name or SCENES.get(scene_id, f"Scene {scene_id}")
+                external_changes.append(f"Scene: {sname}")
+            self.state["scene_id"] = scene_id
 
         # Update Color or Kelvin
         rgb = info.get("rgb")
@@ -1097,7 +1173,11 @@ class WizctlGUI:
             self.kelvin_label.config(text=f"{kelvin} K")
             self.kelvin_slider.set(kelvin)
 
-        self._log_activity(f"✓ Connected to {info['ip']} ({elapsed_ms}ms)")
+        if external_changes:
+            changes_str = ", ".join(external_changes)
+            self._log_activity(f"⚡ Live update ({changes_str})")
+        else:
+            self._log_activity(f"✓ Connected to {info['ip']} ({elapsed_ms}ms)")
         save_state(self.state)
 
     def _apply_bulb_offline(self, err_msg: str):
@@ -1113,7 +1193,7 @@ class WizctlGUI:
     def _schedule_auto_ping(self):
         """Background periodic ping to maintain live bulb state."""
         self.ping_bulb()
-        self._auto_ping_job = self.root.after(10000, self._schedule_auto_ping)
+        self._auto_ping_job = self.root.after(3000, self._schedule_auto_ping)
 
     def _update_power_button_ui(self, power: bool):
         if power:
@@ -1130,24 +1210,46 @@ class WizctlGUI:
             )
 
     def toggle_power(self):
-        """Toggle bulb power."""
+        """Toggle bulb power with live state verification to prevent stale overrides."""
         ip = self._get_current_ip()
-        new_power = not self.state.get("power", True)
-        self.state["power"] = new_power
-        self._update_power_button_ui(new_power)
+        cached_power = self.state.get("power", True)
+        optimistic_power = not cached_power
+        self.state["power"] = optimistic_power
+        self._update_power_button_ui(optimistic_power)
 
         async def _do_toggle():
             async with get_bulb(ip) as bulb:
-                if new_power:
+                states = await bulb.updateState()
+                live_power = None
+                if states and states[0] and states[0].get_state() is not None:
+                    live_power = bool(states[0].get_state())
+
+                target_power = (not live_power) if live_power is not None else optimistic_power
+                if target_power:
                     await bulb.turn_on()
                 else:
                     await bulb.turn_off()
+                return target_power, live_power
 
-        def _on_success(_):
-            self._log_activity(f"✓ Bulb turned {'ON' if new_power else 'OFF'}")
+        def _on_success(res):
+            if isinstance(res, tuple):
+                target_power, live_power = res
+            else:
+                target_power, live_power = optimistic_power, None
+
+            self.state["power"] = target_power
+            self._update_power_button_ui(target_power)
+            if live_power is not None and live_power == optimistic_power:
+                self._log_activity(
+                    f"✓ Synced external state ({'ON' if live_power else 'OFF'}) → toggled {'ON' if target_power else 'OFF'}"
+                )
+            else:
+                self._log_activity(f"✓ Bulb turned {'ON' if target_power else 'OFF'}")
             save_state(self.state)
 
         def _on_error(exc):
+            self.state["power"] = cached_power
+            self._update_power_button_ui(cached_power)
             self._log_activity(f"Error toggling power: {exc}", is_error=True)
 
         self.worker.submit(_do_toggle(), on_success=_on_success, on_error=_on_error)
@@ -1210,11 +1312,20 @@ class WizctlGUI:
 
         async def _do_color():
             async with get_bulb(ip) as bulb:
+                states = await bulb.updateState()
+                live_power = states[0].get_state() if states and states[0] else None
                 await bulb.turn_on(PilotBuilder(rgb=rgb))
+                return live_power
 
-        def _on_success(_):
+        def _on_success(live_power):
             hex_code = f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
-            self._log_activity(f"✓ Color {hex_code} sent")
+            if live_power is False:
+                self.state["power"] = True
+                self._update_power_button_ui(True)
+                self._log_activity(f"✓ Bulb turned ON & color {hex_code} sent")
+            else:
+                self._log_activity(f"✓ Color {hex_code} sent")
+            save_state(self.state)
 
         def _on_error(exc):
             self._log_activity(f"Error setting color: {exc}", is_error=True)
@@ -1264,11 +1375,20 @@ class WizctlGUI:
 
         async def _do_brightness():
             async with get_bulb(ip) as bulb:
+                states = await bulb.updateState()
+                live_power = states[0].get_state() if states and states[0] else None
                 await bulb.turn_on(PilotBuilder(brightness=brightness))
+                return live_power
 
-        def _on_success(_):
+        def _on_success(live_power):
             pct = int(brightness * 100 / 255)
-            self._log_activity(f"✓ Brightness set to {pct}% ({brightness}/255)")
+            if live_power is False:
+                self.state["power"] = True
+                self._update_power_button_ui(True)
+                self._log_activity(f"✓ Bulb turned ON & brightness set to {pct}% ({brightness}/255)")
+            else:
+                self._log_activity(f"✓ Brightness set to {pct}% ({brightness}/255)")
+            save_state(self.state)
 
         def _on_error(exc):
             self._log_activity(f"Error setting brightness: {exc}", is_error=True)
@@ -1307,10 +1427,19 @@ class WizctlGUI:
 
         async def _do_kelvin():
             async with get_bulb(ip) as bulb:
+                states = await bulb.updateState()
+                live_power = states[0].get_state() if states and states[0] else None
                 await bulb.turn_on(PilotBuilder(colortemp=kval))
+                return live_power
 
-        def _on_success(_):
-            self._log_activity(f"✓ Temperature set to {kval}K")
+        def _on_success(live_power):
+            if live_power is False:
+                self.state["power"] = True
+                self._update_power_button_ui(True)
+                self._log_activity(f"✓ Bulb turned ON & temperature set to {kval}K")
+            else:
+                self._log_activity(f"✓ Temperature set to {kval}K")
+            save_state(self.state)
 
         def _on_error(exc):
             self._log_activity(f"Error setting temperature: {exc}", is_error=True)
@@ -1325,10 +1454,18 @@ class WizctlGUI:
 
         async def _do_scene():
             async with get_bulb(ip) as bulb:
+                states = await bulb.updateState()
+                live_power = states[0].get_state() if states and states[0] else None
                 await bulb.turn_on(PilotBuilder(scene=scene_id))
+                return live_power
 
-        def _on_success(_):
-            self._log_activity(f"✓ Scene activated: {scene_name} (#{scene_id})")
+        def _on_success(live_power):
+            if live_power is False:
+                self.state["power"] = True
+                self._update_power_button_ui(True)
+                self._log_activity(f"✓ Bulb turned ON & scene activated: {scene_name} (#{scene_id})")
+            else:
+                self._log_activity(f"✓ Scene activated: {scene_name} (#{scene_id})")
             save_state(self.state)
 
         def _on_error(exc):

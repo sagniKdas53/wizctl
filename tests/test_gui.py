@@ -275,4 +275,64 @@ def test_gui_drag_and_drop_event(tk_root, tmp_path):
             app._on_close()
 
 
+def test_gui_detects_external_changes(tk_root, tmp_path):
+    mock_state_file = tmp_path / "state.json"
+    with patch("wizctl.state.get_state_file_path", return_value=mock_state_file):
+        with patch.object(WizctlGUI, "ping_bulb"):
+            app = WizctlGUI(tk_root, target_ip="192.168.1.100")
+            app.state["power"] = True
+            app.state["scene_id"] = 6  # Cozy
+            app.state["brightness"] = 255
+
+            # Simulate external change from WiZclick (toggled twice to Night light with lower brightness)
+            external_status = {
+                "ip": "192.168.1.100",
+                "mac": "a1b2c3d4e5f6",
+                "rssi": -60,
+                "power": True,
+                "brightness": 26,  # 10%
+                "scene": "Night light",
+                "scene_id": 14,
+            }
+
+            app._apply_bulb_status(external_status, elapsed_ms=15)
+
+            assert app.state["scene_id"] == 14
+            assert app.state["brightness"] == 26
+            assert "⚡ Live update" in app.activity_bar.cget("text")
+            assert "Night light" in app.activity_bar.cget("text")
+
+            app._on_close()
+
+
+def test_gui_power_toggle_stale_state_reconciliation(tk_root, tmp_path):
+    mock_state_file = tmp_path / "state.json"
+    with patch("wizctl.state.get_state_file_path", return_value=mock_state_file):
+        with patch.object(WizctlGUI, "ping_bulb"):
+            app = WizctlGUI(tk_root, target_ip="192.168.1.100")
+            # GUI thinks bulb is ON
+            app.state["power"] = True
+
+            # In background, bulb was actually turned OFF externally
+            # When toggle_power runs and worker succeeds, test callback reconciliation
+            submitted_coros = []
+
+            def mock_submit(coro, on_success=None, on_error=None):
+                submitted_coros.append(coro)
+                # Call on_success with (target_power=True, live_power=False)
+                # because the live state was OFF, so toggling turned it ON
+                if on_success:
+                    on_success((True, False))
+
+            with patch.object(app.worker, "submit", side_effect=mock_submit):
+                app.toggle_power()
+                assert app.state["power"] is True
+                assert "Synced external state (OFF) → toggled ON" in app.activity_bar.cget("text")
+
+            for c in submitted_coros:
+                c.close()
+            app._on_close()
+
+
+
 

@@ -19,6 +19,7 @@ from wizctl.bulb import (
     command_scenes,
     command_status,
     command_toggle,
+    command_wizclick,
 )
 from wizctl.palette import PaletteError, extract_palette, format_palette
 from wizctl.palette_tui import PaletteTuiError, choose_palette_color, supports_tui
@@ -107,6 +108,18 @@ def create_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("scenes", help="list all available WiZ scenes")
 
+    wizclick = sub.add_parser(
+        "wizclick",
+        help="view or trigger WiZclick wall switch modes (Cozy / Night light)",
+    )
+    wizclick.add_argument(
+        "mode",
+        nargs="?",
+        type=int,
+        choices=[1, 2],
+        help="WiZclick mode to trigger (1 for 1st click, 2 for 2nd quick click)",
+    )
+
     return parser
 
 
@@ -130,6 +143,8 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
             await command_toggle(ip)
         elif args.command == "status":
             await command_status(ip)
+        elif args.command == "wizclick":
+            await command_wizclick(ip, args.mode)
         elif args.command == "color":
             await command_color(ip, args.value)
         elif args.command == "palette":

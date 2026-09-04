@@ -103,3 +103,32 @@ class TestCLIMain:
         assert exit_code == 0
         assert called_with_ip == ["192.168.1.99"]
 
+    def test_parser_wizclick_no_arg(self):
+        parser = create_parser()
+        args = parser.parse_args(["wizclick"])
+        assert args.command == "wizclick"
+        assert args.mode is None
+
+    def test_parser_wizclick_mode(self):
+        parser = create_parser()
+        args = parser.parse_args(["wizclick", "1"])
+        assert args.command == "wizclick"
+        assert args.mode == 1
+
+    def test_main_wizclick_list(self, monkeypatch, capsys):
+        from unittest.mock import AsyncMock
+        mock_cmd = AsyncMock(return_value=(0, ""))
+        monkeypatch.setattr("wizctl.cli.command_wizclick", mock_cmd)
+        exit_code = main(["wizclick"])
+        assert exit_code == 0
+        mock_cmd.assert_called_with("192.168.0.102", None)
+
+    def test_main_wizclick_apply(self, monkeypatch):
+        from unittest.mock import AsyncMock
+        mock_cmd = AsyncMock(return_value=(6, "Cozy"))
+        monkeypatch.setattr("wizctl.cli.command_wizclick", mock_cmd)
+        exit_code = main(["wizclick", "1"])
+        assert exit_code == 0
+        mock_cmd.assert_called_with("192.168.0.102", 1)
+
+
