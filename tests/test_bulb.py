@@ -6,6 +6,8 @@ import pytest
 from pywizlight.exceptions import WizLightConnectionError, WizLightTimeOutError
 
 from wizctl.bulb import (
+    StateConflictError,
+    apply_update,
     command_brightness,
     command_color,
     command_kelvin,
@@ -16,6 +18,7 @@ from wizctl.bulb import (
     command_status,
     command_toggle,
     get_status_info,
+    state_token_from_raw,
 )
 
 
@@ -28,7 +31,106 @@ async def test_get_status_info(mock_wizlight):
         assert info["power"] is True
         assert info["brightness"] == 255
         assert info["rgb"] == (255, 0, 0)
+        assert info["state_token"]
         assert mock_wizlight.async_close.called
+
+
+def test_state_token_ignores_telemetry():
+    raw = {
+        "state": True,
+        "dimming": 50,
+        "sceneId": 6,
+        "rssi": -40,
+    }
+    changed_rssi = {**raw, "rssi": -70}
+    changed_brightness = {**raw, "dimming": 60}
+
+    assert state_token_from_raw(raw) == state_token_from_raw(changed_rssi)
+    assert state_token_from_raw(raw) != state_token_from_raw(changed_brightness)
+
+
+@pytest.mark.asyncio
+async def test_apply_update_rejects_stale_state(mock_wizlight):
+    with patch("wizctl.bulb.wizlight", return_value=mock_wizlight):
+        with pytest.raises(StateConflictError) as excinfo:
+            await apply_update(
+                "192.168.0.102",
+                expected_state_token="stale-token",
+                brightness=128,
+            )
+
+    assert not mock_wizlight.turn_on.called
+    assert not mock_wizlight.turn_off.called
+    assert excinfo.value.current_state["power"] is True
+    assert excinfo.value.current_state_token == excinfo.value.current_state["state_token"]
+
+
+@pytest.mark.asyncio
+async def test_apply_update_sends_only_requested_delta(mock_wizlight):
+    # First updateState() is the pre-write check; the second is post-write readback.
+    mock_wizlight.updateState.side_effect = [
+        mock_wizlight.updateState.return_value,
+        mock_wizlight.updateState.return_value,
+    ]
+
+    current = mock_wizlight.updateState.return_value[0]
+    token = state_token_from_raw(current.pilotResult)
+
+    with patch("wizctl.bulb.wizlight", return_value=mock_wizlight):
+        result = await apply_update(
+            "192.168.0.102",
+            expected_state_token=token,
+            brightness=128,
+        )
+
+    mock_wizlight.turn_on.assert_called_once()
+    pilot = mock_wizlight.turn_on.call_args.args[0]
+    assert pilot.pilot_params == {"brightness": 128}
+    assert result["state_token"] == token
+
+
+@pytest.mark.asyncio
+async def test_apply_update_noop_power_does_not_send(mock_wizlight):
+    current = mock_wizlight.updateState.return_value[0]
+    token = state_token_from_raw(current.pilotResult)
+
+    with patch("wizctl.bulb.wizlight", return_value=mock_wizlight):
+        result = await apply_update(
+            "192.168.0.102",
+            expected_state_token=token,
+            power=True,
+        )
+
+    assert result["power"] is True
+    assert not mock_wizlight.turn_on.called
+    assert not mock_wizlight.turn_off.called
+
+
+@pytest.mark.asyncio
+async def test_apply_update_turn_off_is_state_only(mock_wizlight):
+    current = mock_wizlight.updateState.return_value[0]
+    token = state_token_from_raw(current.pilotResult)
+
+    with patch("wizctl.bulb.wizlight", return_value=mock_wizlight):
+        await apply_update(
+            "192.168.0.102",
+            expected_state_token=token,
+            power=False,
+        )
+
+    mock_wizlight.turn_off.assert_called_once_with()
+    assert not mock_wizlight.turn_on.called
+
+
+@pytest.mark.asyncio
+async def test_apply_update_rejects_off_with_mode_change(mock_wizlight):
+    with patch("wizctl.bulb.wizlight", return_value=mock_wizlight):
+        with pytest.raises(ValueError):
+            await apply_update(
+                "192.168.0.102",
+                power=False,
+                brightness=128,
+            )
 
 
 @pytest.mark.asyncio
