@@ -3,12 +3,14 @@
 from pathlib import Path
 from PIL import Image, ImageEnhance
 
-SOURCE_IMG = "/home/sagnik/.gemini/antigravity-ide/brain/f5eb4efd-5b54-4b1f-9823-e8aaab730fc5/wizctl_app_icon_1788880481007.jpg"
+SOURCE_IMG = "/home/sagnik/.gemini/antigravity-ide/brain/f5eb4efd-5b54-4b1f-9823-e8aaab730fc5/bulb_icon_512_transparent.png"
 ASSETS_DIR = Path("/home/sagnik/Projects/wizctl/src/wizctl/assets")
 ASSETS_DIR.mkdir(parents=True, exist_ok=True)
 
 def main():
     img = Image.open(SOURCE_IMG).convert("RGBA")
+    r, g, b, a = img.split()
+    rgb = Image.merge("RGB", (r, g, b))
     
     # Save base 512x512 icon
     base_512 = img.resize((512, 512), Image.Resampling.LANCZOS)
@@ -32,19 +34,22 @@ def main():
     panel_on = img.resize((32, 32), Image.Resampling.LANCZOS)
     panel_on.save(ASSETS_DIR / "panel_bulb_on.png", format="PNG")
     
-    # 2. Bulb OFF (desaturated, darker)
-    grayscale = img.convert("L").convert("RGBA")
-    enhancer = ImageEnhance.Brightness(grayscale)
-    dimmed = enhancer.enhance(0.4)
-    panel_off = dimmed.resize((32, 32), Image.Resampling.LANCZOS)
+    # 2. Bulb OFF (desaturated, unlit frosted dome)
+    gray_rgb = rgb.convert("L").convert("RGB")
+    dimmed_rgb = ImageEnhance.Brightness(gray_rgb).enhance(0.6)
+    panel_off_full = Image.merge("RGBA", (*dimmed_rgb.split(), a))
+    panel_off = panel_off_full.resize((32, 32), Image.Resampling.LANCZOS)
     panel_off.save(ASSETS_DIR / "panel_bulb_off.png", format="PNG")
     
-    # 3. Bulb OFFLINE (muted with subtle tint)
-    offline = enhancer.enhance(0.25)
-    panel_offline = offline.resize((32, 32), Image.Resampling.LANCZOS)
+    # 3. Bulb OFFLINE (muted with subtle opacity)
+    offline_rgb = ImageEnhance.Brightness(gray_rgb).enhance(0.4)
+    # slightly reduce alpha for offline/unreachable indicator
+    dimmed_a = ImageEnhance.Brightness(a).enhance(0.7)
+    panel_offline_full = Image.merge("RGBA", (*offline_rgb.split(), dimmed_a))
+    panel_offline = panel_offline_full.resize((32, 32), Image.Resampling.LANCZOS)
     panel_offline.save(ASSETS_DIR / "panel_bulb_offline.png", format="PNG")
     
-    print(f"✓ All assets successfully generated in {ASSETS_DIR}")
+    print(f"✓ All transparent assets successfully generated in {ASSETS_DIR}")
 
 if __name__ == "__main__":
     main()
