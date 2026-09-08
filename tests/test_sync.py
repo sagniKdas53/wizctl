@@ -145,3 +145,94 @@ def test_reconnect_pushes_saved_preset_when_configured(tk_root, tmp_path):
                 assert "restoring saved preset" in app.activity_bar.cget("text")
 
             app._on_close()
+
+
+def test_ping_rate_limiting_cooldown(tk_root, tmp_path):
+    """Verify that pings within cooldown window are suppressed unless force=True."""
+    mock_state_file = tmp_path / "state.json"
+    with patch("wizctl.state.get_state_file_path", return_value=mock_state_file):
+        with patch.object(WizctlGUI, "ping_bulb"):
+            app = WizctlGUI(tk_root, target_ip="192.168.1.100")
+
+        with patch.object(app.worker, "submit") as mock_submit:
+            # 1. First ping (forced)
+            app.ping_bulb(force=True)
+            assert mock_submit.call_count == 1
+
+            # 2. Second ping immediately after (non-forced) -> should be suppressed
+            app.is_pinging = False
+            app.ping_bulb(force=False)
+            assert mock_submit.call_count == 1
+
+            # 3. Third ping with force=True -> should trigger despite recent ping
+            app.is_pinging = False
+            app.ping_bulb(force=True)
+            assert mock_submit.call_count == 2
+
+        app._on_close()
+
+
+def test_offline_progressive_backoff(tk_root, tmp_path):
+    """Verify that consecutive offline pings trigger progressive backoff delays."""
+    mock_state_file = tmp_path / "state.json"
+    with patch("wizctl.state.get_state_file_path", return_value=mock_state_file):
+        with patch.object(WizctlGUI, "ping_bulb"):
+            app = WizctlGUI(tk_root, target_ip="192.168.1.100")
+
+        scheduled_delays = []
+        with patch.object(app, "_schedule_auto_ping", side_effect=lambda d: scheduled_delays.append(d)):
+            # 1st failure: 6000ms
+            app._apply_bulb_offline("Timeout 1")
+            assert app._consecutive_ping_failures == 1
+            assert scheduled_delays[-1] == 6000
+
+            # 2nd failure: 12000ms
+            app._apply_bulb_offline("Timeout 2")
+            assert app._consecutive_ping_failures == 2
+            assert scheduled_delays[-1] == 12000
+
+            # 3rd failure: 20000ms
+            app._apply_bulb_offline("Timeout 3")
+            assert app._consecutive_ping_failures == 3
+            assert scheduled_delays[-1] == 20000
+
+            # 4th failure: capped at 30000ms
+            app._apply_bulb_offline("Timeout 4")
+            assert app._consecutive_ping_failures == 4
+            assert scheduled_delays[-1] == 30000
+
+            # Reconnecting should reset failure count to 0
+            live_status = {
+                "ip": "192.168.1.100",
+                "power": True,
+                "brightness": 128,
+                "rgb": None,
+                "colortemp": 2700,
+                "scene_id": 0,
+            }
+            app._apply_bulb_status(live_status, elapsed_ms=15)
+            assert app._consecutive_ping_failures == 0
+
+        app._on_close()
+
+
+def test_focus_in_cooldown(tk_root, tmp_path):
+    """Verify that FocusIn events do not spam pings if cooldown has not passed."""
+    mock_state_file = tmp_path / "state.json"
+    with patch("wizctl.state.get_state_file_path", return_value=mock_state_file):
+        with patch.object(WizctlGUI, "ping_bulb"):
+            app = WizctlGUI(tk_root, target_ip="192.168.1.100")
+
+        with patch.object(app, "ping_bulb") as mock_ping:
+            # Set last ping time to right now
+            import time
+            app._last_ping_time = time.time()
+            app._on_focus_in()
+            assert not mock_ping.called
+
+            # Set last ping time to 10 seconds ago
+            app._last_ping_time = time.time() - 10.0
+            app._on_focus_in()
+            assert mock_ping.called
+
+        app._on_close()

@@ -115,7 +115,7 @@ async def get_favorites(ip: str) -> List[Dict]:
             return []
 
 
-async def get_status_info(ip: str) -> Dict:
+async def get_status_info(ip: str, fetch_favorites: bool = False) -> Dict:
     """Fetch status dictionary from the bulb."""
     async with get_bulb(ip) as bulb:
         states = await bulb.updateState()
@@ -127,23 +127,24 @@ async def get_status_info(ip: str) -> Dict:
         has_rgb = rgb is not None and rgb[0] is not None
 
         favorites = []
-        try:
-            resp = await bulb.send({"method": "getFavs", "params": {}})
-            favs_raw = resp.get("result", {}).get("favs", []) if isinstance(resp, dict) else []
-            for idx, fav in enumerate(favs_raw):
-                if isinstance(fav, (list, tuple)) and len(fav) > 0:
-                    sid = fav[0]
-                elif isinstance(fav, int):
-                    sid = fav
-                else:
-                    continue
-                favorites.append({
-                    "mode": idx + 1,
-                    "scene_id": sid,
-                    "scene_name": SCENES.get(sid, f"Scene {sid}") if sid else "None",
-                })
-        except Exception:
-            pass
+        if fetch_favorites:
+            try:
+                resp = await bulb.send({"method": "getFavs", "params": {}})
+                favs_raw = resp.get("result", {}).get("favs", []) if isinstance(resp, dict) else []
+                for idx, fav in enumerate(favs_raw):
+                    if isinstance(fav, (list, tuple)) and len(fav) > 0:
+                        sid = fav[0]
+                    elif isinstance(fav, int):
+                        sid = fav
+                    else:
+                        continue
+                    favorites.append({
+                        "mode": idx + 1,
+                        "scene_id": sid,
+                        "scene_name": SCENES.get(sid, f"Scene {sid}") if sid else "None",
+                    })
+            except Exception:
+                pass
 
         source = state.get_source() if hasattr(state, "get_source") else state.pilotResult.get("src")
 
@@ -165,7 +166,7 @@ async def get_status_info(ip: str) -> Dict:
 
 async def command_status(ip: str) -> None:
     """Show formatted bulb status."""
-    info = await get_status_info(ip)
+    info = await get_status_info(ip, fetch_favorites=True)
 
     print(f"Bulb:       {info['ip']}")
 

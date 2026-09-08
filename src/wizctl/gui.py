@@ -326,6 +326,9 @@ class WizctlGUI:
         self.is_online = False
         self.is_pinging = False
         self._auto_ping_job = None
+        self._last_ping_time: float = 0.0
+        self._consecutive_ping_failures: int = 0
+        self._is_window_focused: bool = True
 
         # Scene button references for highlighting
         self.scene_buttons: Dict[int, tk.Button] = {}
@@ -344,14 +347,15 @@ class WizctlGUI:
         self.root.bind("<Control-v>", self._on_paste_event)
         self.root.bind("<Control-V>", self._on_paste_event)
 
-        # Refresh bulb state when window gains focus
-        self.root.bind("<FocusIn>", lambda e: self.ping_bulb() if not self.is_pinging else None)
+        # Smart focus bindings with cooldown rate limiting
+        self.root.bind("<FocusIn>", self._on_focus_in)
+        self.root.bind("<FocusOut>", self._on_focus_out)
 
         # Auto-save state on close
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # Initial ping to detect bulb status immediately
-        self.root.after(100, self.ping_bulb)
+        self.root.after(100, lambda: self.ping_bulb(force=True))
 
     def _setup_dnd(self):
         """Register OS drag and drop handlers if available."""
@@ -430,7 +434,7 @@ class WizctlGUI:
         )
         self.ip_entry.insert(0, self.state.get("ip", DEFAULT_BULB_IP))
         self.ip_entry.pack(side=tk.LEFT, padx=(0, 8), fill=tk.X, expand=True)
-        self.ip_entry.bind("<Return>", lambda e: self.ping_bulb())
+        self.ip_entry.bind("<Return>", lambda e: self.ping_bulb(force=True))
 
         self.ping_btn = tk.Button(
             top_row,
@@ -444,7 +448,7 @@ class WizctlGUI:
             padx=10,
             pady=4,
             cursor="hand2",
-            command=self.ping_bulb,
+            command=lambda: self.ping_bulb(force=True),
         )
         self.ping_btn.pack(side=tk.RIGHT)
 
@@ -1154,13 +1158,35 @@ class WizctlGUI:
 
     # --- Bulb Communication & Handlers ---
 
-    def ping_bulb(self):
+    def _on_focus_in(self, event=None):
+        """Smart focus handler: only ping if enough cooldown has passed."""
+        if event and event.widget != self.root:
+            return
+        self._is_window_focused = True
+        now = time.time()
+        if now - getattr(self, "_last_ping_time", 0.0) >= 8.0 and not getattr(self, "is_pinging", False):
+            self.ping_bulb(force=False)
+
+    def _on_focus_out(self, event=None):
+        """Track when window loses focus to reduce background poll frequency."""
+        if event and event.widget != self.root:
+            return
+        self._is_window_focused = False
+
+    def ping_bulb(self, force: bool = False):
         """Ping the bulb and refresh all state values in the GUI."""
         if getattr(self, "is_pinging", False):
             return
         if not hasattr(self, "root") or not self.root.winfo_exists():
             return
 
+        now = time.time()
+        # Enforce minimum cooldown of 5s unless forced (e.g. manual Ping button)
+        if not force and (now - getattr(self, "_last_ping_time", 0.0) < 5.0):
+            self._schedule_auto_ping()
+            return
+
+        self._last_ping_time = now
         ip_raw = self.ip_entry.get().strip() or DEFAULT_BULB_IP
         try:
             ip = validate_ip(ip_raw)
@@ -1200,6 +1226,7 @@ class WizctlGUI:
         was_offline = not self.is_online
         self.is_online = True
         self.is_pinging = False
+        self._consecutive_ping_failures = 0
         self.ping_btn.config(state=tk.NORMAL)
 
         self.status_dot.config(fg=ACCENT_GREEN)
@@ -1220,7 +1247,7 @@ class WizctlGUI:
                 on_success=lambda _: self._log_activity("✓ Restored saved state to bulb on reconnect"),
                 on_error=lambda e: self._log_activity(f"Failed to restore state: {e}", is_error=True),
             )
-            self._schedule_auto_ping(3000)
+            self._schedule_auto_ping(12000)
             return
 
         old_power = self.state.get("power")
@@ -1314,7 +1341,8 @@ class WizctlGUI:
             self._log_activity(f"✓ Connected to {info['ip']} ({elapsed_ms}ms)")
 
         save_state(self.state)
-        self._schedule_auto_ping(3000)
+        interval = 12000 if getattr(self, "_is_window_focused", True) else 25000
+        self._schedule_auto_ping(interval)
 
     def _apply_bulb_offline(self, err_msg: str):
         """Callback when ping fails."""
@@ -1322,23 +1350,28 @@ class WizctlGUI:
             return
         self.is_online = False
         self.is_pinging = False
+        self._consecutive_ping_failures += 1
         self.ping_btn.config(state=tk.NORMAL)
         self.status_dot.config(fg=ACCENT_RED)
         self.status_label.config(text="Offline (Unreachable)", fg=ACCENT_RED)
         self.signal_label.config(text="")
         self._log_activity(f"Connection failed: {err_msg}", is_error=True)
-        self._schedule_auto_ping(4000)
+        backoffs = [6000, 12000, 20000, 30000]
+        idx = min(self._consecutive_ping_failures - 1, len(backoffs) - 1)
+        self._schedule_auto_ping(backoffs[max(0, idx)])
 
-    def _schedule_auto_ping(self, delay_ms: int = 3000):
+    def _schedule_auto_ping(self, delay_ms: Optional[int] = None):
         """Background periodic ping to maintain live bulb state."""
         if not hasattr(self, "root") or not self.root.winfo_exists():
             return
+        if delay_ms is None:
+            delay_ms = 12000 if getattr(self, "_is_window_focused", True) else 25000
         if self._auto_ping_job:
             try:
                 self.root.after_cancel(self._auto_ping_job)
             except Exception:
                 pass
-        self._auto_ping_job = self.root.after(delay_ms, self.ping_bulb)
+        self._auto_ping_job = self.root.after(delay_ms, lambda: self.ping_bulb(force=False) if hasattr(self, "root") and self.root.winfo_exists() else None)
 
     def _update_power_button_ui(self, power: bool):
         if power:
@@ -1391,6 +1424,7 @@ class WizctlGUI:
             else:
                 self._log_activity(f"✓ Bulb turned {'ON' if target_power else 'OFF'}")
             save_state(self.state)
+            self._schedule_auto_ping(12000)
 
         def _on_error(exc):
             self.state["power"] = cached_power
@@ -1463,20 +1497,15 @@ class WizctlGUI:
 
         async def _do_color():
             async with get_bulb(ip) as bulb:
-                states = await bulb.updateState()
-                live_power = states[0].get_state() if states and states[0] else None
                 await bulb.turn_on(PilotBuilder(rgb=rgb))
-                return live_power
 
-        def _on_success(live_power):
+        def _on_success(_):
             hex_code = f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
-            if live_power is False:
-                self.state["power"] = True
-                self._update_power_button_ui(True)
-                self._log_activity(f"✓ Bulb turned ON & color {hex_code} sent")
-            else:
-                self._log_activity(f"✓ Color {hex_code} sent")
+            self.state["power"] = True
+            self._update_power_button_ui(True)
+            self._log_activity(f"✓ Color {hex_code} sent")
             save_state(self.state)
+            self._schedule_auto_ping(12000)
 
         def _on_error(exc):
             self._log_activity(f"Error setting color: {exc}", is_error=True)
@@ -1526,20 +1555,15 @@ class WizctlGUI:
 
         async def _do_brightness():
             async with get_bulb(ip) as bulb:
-                states = await bulb.updateState()
-                live_power = states[0].get_state() if states and states[0] else None
                 await bulb.turn_on(PilotBuilder(brightness=brightness))
-                return live_power
 
-        def _on_success(live_power):
-            pct = int(brightness * 100 / 255)
-            if live_power is False:
-                self.state["power"] = True
-                self._update_power_button_ui(True)
-                self._log_activity(f"✓ Bulb turned ON & brightness set to {pct}% ({brightness}/255)")
-            else:
-                self._log_activity(f"✓ Brightness set to {pct}% ({brightness}/255)")
+        def _on_success(_):
+            pct = int(round(brightness * 100 / 255))
+            self.state["power"] = True
+            self._update_power_button_ui(True)
+            self._log_activity(f"✓ Brightness set to {pct}% ({brightness}/255)")
             save_state(self.state)
+            self._schedule_auto_ping(12000)
 
         def _on_error(exc):
             self._log_activity(f"Error setting brightness: {exc}", is_error=True)
@@ -1586,19 +1610,14 @@ class WizctlGUI:
 
         async def _do_kelvin():
             async with get_bulb(ip) as bulb:
-                states = await bulb.updateState()
-                live_power = states[0].get_state() if states and states[0] else None
                 await bulb.turn_on(PilotBuilder(colortemp=kval))
-                return live_power
 
-        def _on_success(live_power):
-            if live_power is False:
-                self.state["power"] = True
-                self._update_power_button_ui(True)
-                self._log_activity(f"✓ Bulb turned ON & temperature set to {kval}K")
-            else:
-                self._log_activity(f"✓ Temperature set to {kval}K")
+        def _on_success(_):
+            self.state["power"] = True
+            self._update_power_button_ui(True)
+            self._log_activity(f"✓ Temperature set to {kval}K")
             save_state(self.state)
+            self._schedule_auto_ping(12000)
 
         def _on_error(exc):
             self._log_activity(f"Error setting temperature: {exc}", is_error=True)
@@ -1615,19 +1634,14 @@ class WizctlGUI:
 
         async def _do_scene():
             async with get_bulb(ip) as bulb:
-                states = await bulb.updateState()
-                live_power = states[0].get_state() if states and states[0] else None
                 await bulb.turn_on(PilotBuilder(scene=scene_id))
-                return live_power
 
-        def _on_success(live_power):
-            if live_power is False:
-                self.state["power"] = True
-                self._update_power_button_ui(True)
-                self._log_activity(f"✓ Bulb turned ON & scene activated: {scene_name} (#{scene_id})")
-            else:
-                self._log_activity(f"✓ Scene activated: {scene_name} (#{scene_id})")
+        def _on_success(_):
+            self.state["power"] = True
+            self._update_power_button_ui(True)
+            self._log_activity(f"✓ Scene activated: {scene_name} (#{scene_id})")
             save_state(self.state)
+            self._schedule_auto_ping(12000)
 
         def _on_error(exc):
             self._log_activity(f"Error activating scene: {exc}", is_error=True)

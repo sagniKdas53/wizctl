@@ -110,6 +110,8 @@ class WizctlWidget:
         self.is_online = False
         self.is_pinging = False
         self._auto_ping_job = None
+        self._last_ping_time: float = 0.0
+        self._consecutive_ping_failures: int = 0
 
         # Set window icon
         icon_path = Path(__file__).parent / "assets" / "icon_32.png"
@@ -443,11 +445,18 @@ class WizctlWidget:
     def _get_ip(self) -> str:
         return self.state.get("ip", DEFAULT_BULB_IP)
 
-    def ping_bulb(self):
+    def ping_bulb(self, force: bool = False):
         """Ping bulb and update widget controls."""
         if getattr(self, "is_pinging", False) or getattr(self, "_is_closed", False):
             return
 
+        now = time.time()
+        # Enforce minimum cooldown of 5s unless forced
+        if not force and (now - getattr(self, "_last_ping_time", 0.0) < 5.0):
+            self._schedule_next_ping(12000)
+            return
+
+        self._last_ping_time = now
         ip = self._get_ip()
         self.is_pinging = True
         self.status_dot.config(fg=ACCENT_AMBER)
@@ -478,6 +487,7 @@ class WizctlWidget:
 
         self.is_online = True
         self.is_pinging = False
+        self._consecutive_ping_failures = 0
         self.status_dot.config(fg=ACCENT_GREEN)
         rssi = f"{info['rssi']} dBm" if info.get("rssi") is not None else f"{elapsed_ms}ms"
         self.status_sub.config(text=f"{info['ip']} ({rssi})", fg=ACCENT_GREEN)
@@ -503,18 +513,21 @@ class WizctlWidget:
                     btn.config(bg=INPUT_BG, fg=TEXT_PRIMARY)
 
         save_state(self.state)
-        self._schedule_next_ping(3000)
+        self._schedule_next_ping(12000)
 
     def _apply_offline(self, err_msg: str):
         if getattr(self, "_is_closed", False) or not self.root.winfo_exists():
             return
         self.is_online = False
         self.is_pinging = False
+        self._consecutive_ping_failures += 1
         self.status_dot.config(fg=ACCENT_RED)
         self.status_sub.config(text="Offline", fg=ACCENT_RED)
-        self._schedule_next_ping(4000)
+        backoffs = [6000, 12000, 20000, 30000]
+        idx = min(self._consecutive_ping_failures - 1, len(backoffs) - 1)
+        self._schedule_next_ping(backoffs[max(0, idx)])
 
-    def _schedule_next_ping(self, delay_ms: int = 3000):
+    def _schedule_next_ping(self, delay_ms: int = 12000):
         if getattr(self, "_is_closed", False) or not self.root.winfo_exists():
             return
         if self._auto_ping_job:
@@ -522,7 +535,7 @@ class WizctlWidget:
                 self.root.after_cancel(self._auto_ping_job)
             except Exception:
                 pass
-        self._auto_ping_job = self.root.after(delay_ms, self.ping_bulb)
+        self._auto_ping_job = self.root.after(delay_ms, lambda: self.ping_bulb(force=False) if not getattr(self, "_is_closed", False) and self.root.winfo_exists() else None)
 
     def _update_power_button(self, power: bool):
         if power:
@@ -554,6 +567,7 @@ class WizctlWidget:
 
         self.worker.submit(_do_toggle())
         save_state(self.state)
+        self._schedule_next_ping(12000)
 
     def _on_brightness_slider(self, val_str: str):
         val = int(float(val_str))
@@ -578,6 +592,7 @@ class WizctlWidget:
                 await bulb.turn_on(PilotBuilder(brightness=val))
         self.worker.submit(_do_b())
         save_state(self.state)
+        self._schedule_next_ping(12000)
 
     def set_kelvin(self, kval: int):
         self.state["kelvin"] = kval
@@ -588,6 +603,7 @@ class WizctlWidget:
                 await bulb.turn_on(PilotBuilder(colortemp=kval))
         self.worker.submit(_do_k())
         save_state(self.state)
+        self._schedule_next_ping(12000)
 
     def set_scene(self, scene_id: int, scene_name: str):
         self.state["scene_id"] = scene_id
@@ -604,6 +620,7 @@ class WizctlWidget:
                 await bulb.turn_on(PilotBuilder(scene=scene_id))
         self.worker.submit(_do_s())
         save_state(self.state)
+        self._schedule_next_ping(12000)
 
     def set_color_hex(self, hex_code: str):
         rgb = parse_color(hex_code)
@@ -616,6 +633,7 @@ class WizctlWidget:
                 await bulb.turn_on(PilotBuilder(rgb=rgb))
         self.worker.submit(_do_c())
         save_state(self.state)
+        self._schedule_next_ping(12000)
 
     def _open_full_gui(self):
         """Open complete wizctl studio GUI and close widget."""
