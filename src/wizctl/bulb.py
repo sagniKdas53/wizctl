@@ -2,6 +2,7 @@
 
 import asyncio
 from contextlib import asynccontextmanager
+import math
 import os
 from typing import AsyncGenerator, Dict, List, Optional, Tuple, Union
 
@@ -10,6 +11,73 @@ from pywizlight import PilotBuilder, SCENES, wizlight
 from wizctl.parsers import parse_brightness, parse_color, parse_kelvin, parse_scene, validate_ip
 
 DEFAULT_BULB_IP = os.environ.get("WIZ_IP", os.environ.get("BULB_IP", "192.168.0.102"))
+
+
+def kelvin_to_rgb(kelvin: int) -> Tuple[int, int, int]:
+    """Convert color temperature in Kelvin (1000K-10000K) to an approximate RGB tuple.
+
+    Uses Tanner Helland's algorithm (based on Planckian blackbody radiator curve).
+    """
+    temp = max(1000, min(40000, int(kelvin))) / 100.0
+
+    # Calculate Red
+    if temp <= 66:
+        red = 255.0
+    else:
+        red = temp - 60
+        red = 329.698727446 * (red ** -0.1332047592)
+        red = max(0.0, min(255.0, red))
+
+    # Calculate Green
+    if temp <= 66:
+        green = max(1.0, temp)
+        green = 99.4708025861 * math.log(green) - 161.1195681661
+        green = max(0.0, min(255.0, green))
+    else:
+        green = max(1.0, temp - 60)
+        green = 288.1221695283 * (green ** -0.0755148492)
+        green = max(0.0, min(255.0, green))
+
+    # Calculate Blue
+    if temp >= 66:
+        blue = 255.0
+    elif temp <= 19:
+        blue = 0.0
+    else:
+        blue = max(1.0, temp - 10)
+        blue = 138.5177312231 * math.log(blue) - 305.0447927307
+        blue = max(0.0, min(255.0, blue))
+
+    return int(round(red)), int(round(green)), int(round(blue))
+
+
+async def apply_saved_state(ip: str, state: Dict) -> None:
+    """Push saved configuration state to the bulb."""
+    async with get_bulb(ip) as bulb:
+        power = state.get("power", True)
+        if not power:
+            await bulb.turn_off()
+            return
+
+        brightness = state.get("brightness", 255)
+        mode = state.get("mode")
+        scene_id = state.get("scene_id")
+        kelvin = state.get("kelvin")
+        rgb = state.get("rgb")
+
+        builder_kwargs = {"brightness": brightness}
+        if mode == "scene" and scene_id:
+            builder_kwargs["scene"] = scene_id
+        elif mode == "kelvin" and kelvin:
+            builder_kwargs["colortemp"] = kelvin
+        elif rgb and len(rgb) == 3:
+            builder_kwargs["rgb"] = (int(rgb[0]), int(rgb[1]), int(rgb[2]))
+        elif kelvin:
+            builder_kwargs["colortemp"] = kelvin
+        elif scene_id:
+            builder_kwargs["scene"] = scene_id
+
+        await bulb.turn_on(PilotBuilder(**builder_kwargs))
 
 
 @asynccontextmanager

@@ -32,6 +32,7 @@ DEFAULT_STATE: Dict[str, Any] = {
     "scene_id": 6,
     "mode": "color",
     "recent_colors": list(DEFAULT_PRESET_COLORS),
+    "restore_on_reconnect": False,
 }
 
 
@@ -121,6 +122,10 @@ def sanitize_state(raw: Dict[str, Any]) -> Dict[str, Any]:
                     pass
         if valid_recents:
             clean["recent_colors"] = valid_recents[:16]
+
+    # Validate restore_on_reconnect
+    if "restore_on_reconnect" in raw and isinstance(raw["restore_on_reconnect"], bool):
+        clean["restore_on_reconnect"] = raw["restore_on_reconnect"]
 
     return clean
 

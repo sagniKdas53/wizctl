@@ -24,7 +24,13 @@ except (ImportError, RuntimeError, Exception):
     HAS_TKDND = False
 
 from wizctl import __version__
-from wizctl.bulb import DEFAULT_BULB_IP, get_bulb, get_status_info
+from wizctl.bulb import (
+    DEFAULT_BULB_IP,
+    apply_saved_state,
+    get_bulb,
+    get_status_info,
+    kelvin_to_rgb,
+)
 from wizctl.palette import PaletteColor, PaletteError, extract_palette
 from wizctl.parsers import parse_brightness, parse_color, parse_kelvin, validate_ip
 from wizctl.state import DEFAULT_PRESET_COLORS, load_state, save_state
@@ -293,6 +299,15 @@ class WizctlGUI:
         self.root.minsize(460, 720)
         self.root.configure(bg=BG_DARK)
 
+        # Set window and taskbar icon
+        icon_path = Path(__file__).parent / "assets" / "icon_64.png"
+        if icon_path.is_file():
+            try:
+                self._app_icon = tk.PhotoImage(file=str(icon_path))
+                self.root.iconphoto(True, self._app_icon)
+            except Exception:
+                pass
+
         # Load persisted state
         self.state = load_state()
         if target_ip:
@@ -311,6 +326,10 @@ class WizctlGUI:
         self.is_online = False
         self.is_pinging = False
         self._auto_ping_job = None
+
+        # Scene button references for highlighting
+        self.scene_buttons: Dict[int, tk.Button] = {}
+        self.wizclick_buttons: Dict[int, tk.Button] = {}
 
         # Image Palette State
         self._current_image_path: Optional[str] = None
@@ -333,7 +352,6 @@ class WizctlGUI:
 
         # Initial ping to detect bulb status immediately
         self.root.after(100, self.ping_bulb)
-        self._schedule_auto_ping()
 
     def _setup_dnd(self):
         """Register OS drag and drop handlers if available."""
@@ -461,6 +479,28 @@ class WizctlGUI:
             fg=TEXT_MUTED,
         )
         self.signal_label.pack(side=tk.RIGHT)
+
+        # Reconnect sync option row
+        sync_opt_row = tk.Frame(conn_card, bg=CARD_BG)
+        sync_opt_row.pack(fill=tk.X, pady=(6, 0))
+
+        self.restore_var = tk.BooleanVar(value=bool(self.state.get("restore_on_reconnect", False)))
+        self.restore_check = tk.Checkbutton(
+            sync_opt_row,
+            text="Auto-restore saved preset when bulb comes online",
+            variable=self.restore_var,
+            command=self._on_toggle_restore_setting,
+            bg=CARD_BG,
+            fg=TEXT_SECONDARY,
+            selectcolor=INPUT_BG,
+            activebackground=CARD_BG,
+            activeforeground=TEXT_PRIMARY,
+            font=("Helvetica", 8),
+            bd=0,
+            highlightthickness=0,
+            cursor="hand2",
+        )
+        self.restore_check.pack(side=tk.LEFT)
 
         # --- 2. Power Toggle Card ---
         power_card = tk.Frame(main_frame, bg=CARD_BG, bd=1, relief=tk.FLAT, padx=12, pady=10)
@@ -783,6 +823,7 @@ class WizctlGUI:
             command=lambda: self.set_scene(6, "Cozy"),
         )
         btn_cozy.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
+        self.wizclick_buttons[6] = btn_cozy
 
         btn_night = tk.Button(
             wc_btn_frame,
@@ -798,6 +839,7 @@ class WizctlGUI:
             command=lambda: self.set_scene(14, "Night light"),
         )
         btn_night.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
+        self.wizclick_buttons[14] = btn_night
 
         scenes_grid = tk.Frame(tab_scenes, bg=CARD_BG)
         scenes_grid.pack(fill=tk.BOTH, expand=True)
@@ -820,9 +862,14 @@ class WizctlGUI:
                 command=lambda s=sid, n=sname: self.set_scene(s, n),
             )
             btn.grid(row=row, column=col, sticky="nsew", padx=3, pady=3)
+            self.scene_buttons[sid] = btn
 
         for c in range(3):
             scenes_grid.grid_columnconfigure(c, weight=1)
+
+        # Highlight active scene if mode is scene
+        if self.state.get("mode") == "scene" and self.state.get("scene_id"):
+            self._highlight_active_scene(self.state.get("scene_id"))
 
         # Tab 4: Image Palette Picker
         self._build_palette_tab()
@@ -1074,13 +1121,46 @@ class WizctlGUI:
 
     def _log_activity(self, message: str, is_error: bool = False):
         """Update bottom activity status bar."""
-        color = ACCENT_RED if is_error else TEXT_MUTED
-        self.activity_bar.config(text=message, fg=color)
+        if getattr(self, "_is_closed", False):
+            return
+        try:
+            if not hasattr(self, "activity_bar") or not self.root.winfo_exists():
+                return
+            color = ACCENT_RED if is_error else TEXT_MUTED
+            self.activity_bar.config(text=message, fg=color)
+        except Exception:
+            pass
+
+    def _on_toggle_restore_setting(self):
+        """Callback when user toggles the restore-on-reconnect checkbox."""
+        val = bool(self.restore_var.get())
+        self.state["restore_on_reconnect"] = val
+        save_state(self.state)
+        msg = "Enabled auto-restoring saved state on reconnect" if val else "Set to follow bulb hardware state on reconnect"
+        self._log_activity(f"✓ {msg}")
+
+    def _highlight_active_scene(self, scene_id: Optional[int]):
+        """Visually highlight the currently active scene button."""
+        for sid, btn in self.scene_buttons.items():
+            if sid == scene_id:
+                btn.config(bg=ACCENT_BLUE, fg="#ffffff", font=("Helvetica", 9, "bold"))
+            else:
+                btn.config(bg=INPUT_BG, fg=TEXT_PRIMARY, font=("Helvetica", 9))
+        for sid, btn in self.wizclick_buttons.items():
+            if sid == scene_id:
+                btn.config(bg=ACCENT_BLUE, fg="#ffffff")
+            else:
+                btn.config(bg=CARD_BG, fg=TEXT_PRIMARY)
 
     # --- Bulb Communication & Handlers ---
 
     def ping_bulb(self):
         """Ping the bulb and refresh all state values in the GUI."""
+        if getattr(self, "is_pinging", False):
+            return
+        if not hasattr(self, "root") or not self.root.winfo_exists():
+            return
+
         ip_raw = self.ip_entry.get().strip() or DEFAULT_BULB_IP
         try:
             ip = validate_ip(ip_raw)
@@ -1100,16 +1180,24 @@ class WizctlGUI:
             return await get_status_info(ip)
 
         def _on_success(info: Dict):
+            if not self.root.winfo_exists():
+                return
             elapsed_ms = int((time.time() - t0) * 1000)
-            self.root.after(0, lambda: self._apply_bulb_status(info, elapsed_ms))
+            self.root.after(0, lambda: self._apply_bulb_status(info, elapsed_ms) if self.root.winfo_exists() else None)
 
         def _on_error(exc: Exception):
-            self.root.after(0, lambda: self._apply_bulb_offline(str(exc)))
+            if not self.root.winfo_exists():
+                return
+            self.root.after(0, lambda: self._apply_bulb_offline(str(exc)) if self.root.winfo_exists() else None)
 
         self.worker.submit(_do_ping(), on_success=_on_success, on_error=_on_error)
 
     def _apply_bulb_status(self, info: Dict, elapsed_ms: int):
         """Callback when status update succeeds."""
+        if not self.root.winfo_exists():
+            return
+
+        was_offline = not self.is_online
         self.is_online = True
         self.is_pinging = False
         self.ping_btn.config(state=tk.NORMAL)
@@ -1122,6 +1210,18 @@ class WizctlGUI:
             fg=ACCENT_GREEN,
         )
         self.signal_label.config(text=rssi_str)
+
+        # Handle user option: Auto-restore saved state when bulb comes back online
+        if was_offline and self.state.get("restore_on_reconnect", False):
+            ip = info.get("ip") or self._get_current_ip()
+            self._log_activity("⚡ Bulb online — restoring saved preset to bulb...")
+            self.worker.submit(
+                apply_saved_state(ip, self.state),
+                on_success=lambda _: self._log_activity("✓ Restored saved state to bulb on reconnect"),
+                on_error=lambda e: self._log_activity(f"Failed to restore state: {e}", is_error=True),
+            )
+            self._schedule_auto_ping(3000)
+            return
 
         old_power = self.state.get("power")
         old_scene = self.state.get("scene_id")
@@ -1138,11 +1238,10 @@ class WizctlGUI:
         # Update Brightness
         b = info.get("brightness")
         if b is not None:
+            pct = int(round(b * 100 / 255))
             if old_bright is not None and abs(old_bright - b) > 5 and not getattr(self, "_is_user_dragging", False):
-                pct = int(b * 100 / 255)
                 external_changes.append(f"Brightness: {pct}%")
             self.state["brightness"] = b
-            pct = int(b * 100 / 255)
             self.brightness_label.config(text=f"{pct}% ({b}/255)")
             self.bright_slider.set(b)
 
@@ -1154,8 +1253,12 @@ class WizctlGUI:
                 sname = scene_name or SCENES.get(scene_id, f"Scene {scene_id}")
                 external_changes.append(f"Scene: {sname}")
             self.state["scene_id"] = scene_id
+            self.state["mode"] = "scene"
+            self._highlight_active_scene(scene_id)
+        else:
+            self._highlight_active_scene(None)
 
-        # Update Color or Kelvin
+        # Update Color
         rgb = info.get("rgb")
         if rgb and rgb[0] is not None:
             self.state["rgb"] = list(rgb)
@@ -1166,22 +1269,57 @@ class WizctlGUI:
             self.hex_entry.insert(0, hex_code)
             self.rgb_info_label.config(text=f"RGB: {rgb[0]}, {rgb[1]}, {rgb[2]}")
             self.color_wheel.set_rgb(rgb, notify=False)
+            if not scene_id or scene_id == 0:
+                self.state["mode"] = "color"
 
+        # Update Kelvin
         kelvin = info.get("colortemp")
         if kelvin:
             self.state["kelvin"] = kelvin
             self.kelvin_label.config(text=f"{kelvin} K")
             self.kelvin_slider.set(kelvin)
+            if not rgb or rgb[0] is None:
+                k_rgb = kelvin_to_rgb(kelvin)
+                self.color_preview.config(bg=f"#{k_rgb[0]:02x}{k_rgb[1]:02x}{k_rgb[2]:02x}")
+                if not scene_id or scene_id == 0:
+                    self.state["mode"] = "kelvin"
+
+        # Select appropriate tab on reconnect / initial sync
+        if was_offline:
+            if scene_id and scene_id != 0:
+                try:
+                    self.notebook.select(2)
+                except Exception:
+                    pass
+            elif rgb and rgb[0] is not None:
+                try:
+                    self.notebook.select(0)
+                except Exception:
+                    pass
+            elif kelvin:
+                try:
+                    self.notebook.select(1)
+                except Exception:
+                    pass
 
         if external_changes:
             changes_str = ", ".join(external_changes)
-            self._log_activity(f"⚡ Live update ({changes_str})")
+            prefix = "⚡ Live update (Bulb online — " if was_offline else "⚡ Live update ("
+            self._log_activity(f"{prefix}{changes_str})")
+        elif was_offline:
+            mode_desc = f"Scene: {SCENES.get(scene_id, scene_id)}" if (scene_id and scene_id != 0) else (f"Kelvin: {kelvin}K" if kelvin else f"Color: {self.state.get('hex')}")
+            pct_str = f", {int(round(b * 100 / 255))}%" if b is not None else ""
+            self._log_activity(f"⚡ Bulb online — synced UI with bulb ({'ON' if power else 'OFF'}{pct_str}, {mode_desc})")
         else:
             self._log_activity(f"✓ Connected to {info['ip']} ({elapsed_ms}ms)")
+
         save_state(self.state)
+        self._schedule_auto_ping(3000)
 
     def _apply_bulb_offline(self, err_msg: str):
         """Callback when ping fails."""
+        if not self.root.winfo_exists():
+            return
         self.is_online = False
         self.is_pinging = False
         self.ping_btn.config(state=tk.NORMAL)
@@ -1189,11 +1327,18 @@ class WizctlGUI:
         self.status_label.config(text="Offline (Unreachable)", fg=ACCENT_RED)
         self.signal_label.config(text="")
         self._log_activity(f"Connection failed: {err_msg}", is_error=True)
+        self._schedule_auto_ping(4000)
 
-    def _schedule_auto_ping(self):
+    def _schedule_auto_ping(self, delay_ms: int = 3000):
         """Background periodic ping to maintain live bulb state."""
-        self.ping_bulb()
-        self._auto_ping_job = self.root.after(3000, self._schedule_auto_ping)
+        if not hasattr(self, "root") or not self.root.winfo_exists():
+            return
+        if self._auto_ping_job:
+            try:
+                self.root.after_cancel(self._auto_ping_job)
+            except Exception:
+                pass
+        self._auto_ping_job = self.root.after(delay_ms, self.ping_bulb)
 
     def _update_power_button_ui(self, power: bool):
         if power:
@@ -1265,6 +1410,8 @@ class WizctlGUI:
 
         self.state["rgb"] = list(rgb)
         self.state["hex"] = hex_code
+        self.state["mode"] = "color"
+        self._highlight_active_scene(None)
 
         now = time.time()
         if now - self._last_send_time >= self._throttle_interval:
@@ -1278,6 +1425,8 @@ class WizctlGUI:
         self._pending_color = None
         self.state["rgb"] = list(rgb)
         self.state["hex"] = hex_code
+        self.state["mode"] = "color"
+        self._highlight_active_scene(None)
         self._send_color(rgb)
         self._record_recent_color(hex_code)
         save_state(self.state)
@@ -1297,6 +1446,8 @@ class WizctlGUI:
         rgb = parse_color(hex_code)
         self.state["rgb"] = list(rgb)
         self.state["hex"] = hex_code
+        self.state["mode"] = "color"
+        self._highlight_active_scene(None)
         self.color_wheel.set_rgb(rgb, notify=False)
         self.color_preview.config(bg=hex_code)
         self.hex_entry.delete(0, tk.END)
@@ -1344,7 +1495,7 @@ class WizctlGUI:
 
     def _on_brightness_slider(self, val_str: str):
         val = int(float(val_str))
-        pct = int(val * 100 / 255)
+        pct = int(round(val * 100 / 255))
         self.brightness_label.config(text=f"{pct}% ({val}/255)")
         self.state["brightness"] = val
 
@@ -1365,7 +1516,7 @@ class WizctlGUI:
         val = max(1, min(255, val))
         self.state["brightness"] = val
         self.bright_slider.set(val)
-        pct = int(val * 100 / 255)
+        pct = int(round(val * 100 / 255))
         self.brightness_label.config(text=f"{pct}% ({val}/255)")
         self._send_brightness(val)
         save_state(self.state)
@@ -1401,6 +1552,10 @@ class WizctlGUI:
         kval = int(float(val_str))
         self.kelvin_label.config(text=f"{kval} K")
         self.state["kelvin"] = kval
+        self.state["mode"] = "kelvin"
+        self._highlight_active_scene(None)
+        k_rgb = kelvin_to_rgb(kval)
+        self.color_preview.config(bg=f"#{k_rgb[0]:02x}{k_rgb[1]:02x}{k_rgb[2]:02x}")
 
         now = time.time()
         if now - self._last_send_time >= self._throttle_interval:
@@ -1417,8 +1572,12 @@ class WizctlGUI:
 
     def set_kelvin(self, kval: int):
         self.state["kelvin"] = kval
+        self.state["mode"] = "kelvin"
         self.kelvin_slider.set(kval)
         self.kelvin_label.config(text=f"{kval} K")
+        self._highlight_active_scene(None)
+        k_rgb = kelvin_to_rgb(kval)
+        self.color_preview.config(bg=f"#{k_rgb[0]:02x}{k_rgb[1]:02x}{k_rgb[2]:02x}")
         self._send_kelvin(kval)
         save_state(self.state)
 
@@ -1451,6 +1610,8 @@ class WizctlGUI:
     def set_scene(self, scene_id: int, scene_name: str):
         ip = self._get_current_ip()
         self.state["scene_id"] = scene_id
+        self.state["mode"] = "scene"
+        self._highlight_active_scene(scene_id)
 
         async def _do_scene():
             async with get_bulb(ip) as bulb:
@@ -1475,12 +1636,20 @@ class WizctlGUI:
 
     def _on_close(self):
         """Cleanup and persist state upon closing window."""
+        self._is_closed = True
         if self._auto_ping_job:
-            self.root.after_cancel(self._auto_ping_job)
+            try:
+                self.root.after_cancel(self._auto_ping_job)
+            except Exception:
+                pass
+            self._auto_ping_job = None
         self.state["ip"] = self._get_current_ip()
         save_state(self.state)
         self.worker.stop()
-        self.root.destroy()
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
 
 
 def run_gui(target_ip: Optional[str] = None) -> int:

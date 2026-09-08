@@ -51,6 +51,13 @@ def create_parser() -> argparse.ArgumentParser:
     )
 
     sub.add_parser("gui", help="open the graphical control panel (default)")
+    widget = sub.add_parser("widget", help="open the compact panel control widget")
+    widget.add_argument(
+        "--click",
+        action="store_true",
+        help="handle panel click with double-click toggle / single-click widget detection",
+    )
+    sub.add_parser("genmon", help="output XML status block for xfce4-genmon-plugin")
     sub.add_parser("on", help="turn the bulb on")
     sub.add_parser("off", help="turn the bulb off")
     sub.add_parser("toggle", help="toggle bulb power state")
@@ -133,6 +140,16 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
     if args.command is None or args.command == "gui":
         from wizctl.gui import run_gui
         return run_gui(target_ip=ip)
+
+    if args.command == "widget":
+        from wizctl.widget import handle_panel_click, run_widget
+        if args.click:
+            return handle_panel_click(target_ip=ip)
+        return run_widget(target_ip=ip)
+
+    if args.command == "genmon":
+        from wizctl.genmon import run_genmon
+        return run_genmon(target_ip=ip)
 
     try:
         if args.command == "on":
