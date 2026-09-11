@@ -1,47 +1,40 @@
-.PHONY: help venv install install-dev test test-live build binary palette clean
+.PHONY: help build release install test check clean run panel
 
-PYTHON ?= python3
-VENV_DIR ?= .venv
-VENV_BIN = $(VENV_DIR)/bin
+PREFIX ?= $(HOME)/.local
+BINDIR = $(PREFIX)/bin
 
 help:
-	@echo "wizctl build & development targets:"
-	@echo "  make venv         - Create Python virtual environment (.venv)"
-	@echo "  make install      - Install package in virtual environment"
-	@echo "  make install-dev  - Install package with development dependencies"
-	@echo "  make test         - Run unit test suite (100+ tests)"
-	@echo "  make test-live    - Run live device integration tests"
-	@echo "  make build        - Build Python wheel and source distribution"
-	@echo "  make binary       - Compile standalone binary executable (dist/wizctl)"
-	@echo "  make palette IMAGE=path - Extract image colors and show wizctl commands"
-	@echo "  make clean        - Remove build artifacts, pycache, dist files"
-
-venv:
-	$(PYTHON) -m venv $(VENV_DIR)
-	$(VENV_BIN)/pip install --upgrade pip setuptools wheel
-
-install: venv
-	$(VENV_BIN)/pip install -e .
-
-install-dev: venv
-	$(VENV_BIN)/pip install -e ".[dev]"
-
-test:
-	$(VENV_BIN)/pytest -v
-
-test-live:
-	$(VENV_BIN)/pytest -v --live tests/test_integration.py
+	@echo "wizctl (Rust + egui) build & development targets:"
+	@echo "  make build       - Build release binary (target/release/wizctl)"
+	@echo "  make test        - Run complete unit and integration test suite"
+	@echo "  make check       - Fast compile check via cargo check"
+	@echo "  make install     - Install binary to ~/.local/bin and install panel widget"
+	@echo "  make panel       - Configure and reload XFCE4 panel launcher"
+	@echo "  make clean       - Remove cargo build artifacts"
+	@echo "  make run         - Run the popover widget"
 
 build:
-	$(VENV_BIN)/python -m build
+	cargo build --release
 
-binary:
-	$(VENV_BIN)/pyinstaller --onefile --clean --name wizctl --paths src src/wizctl/__main__.py
+release: build
 
-palette:
-	@test -n "$(IMAGE)" || (echo "Set IMAGE to an image path, for example: make palette IMAGE=photo.jpg"; exit 2)
-	$(VENV_BIN)/python scripts/extract_palette.py "$(IMAGE)"
+check:
+	cargo check
+
+test:
+	cargo test
+
+install: build
+	mkdir -p $(BINDIR)
+	cp target/release/wizctl $(BINDIR)/wizctl
+	chmod +x $(BINDIR)/wizctl
+	./scripts/setup_panel_widget.sh
+
+panel:
+	./scripts/setup_panel_widget.sh
 
 clean:
-	rm -rf build/ dist/ *.egg-info/ .pytest_cache/ *.spec
-	find . -type d -name "__pycache__" -exec rm -rf {} +
+	cargo clean
+
+run:
+	cargo run -- widget

@@ -11,6 +11,8 @@ build/
 dist/
 *.egg-info/
 .eggs/
+target/
+.worktrees/
 
 # Virtual environments
 .venv/
