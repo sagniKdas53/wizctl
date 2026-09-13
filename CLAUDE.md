@@ -27,9 +27,9 @@ The default target bulb IP is `192.168.0.102`, overridable via `--ip`, `WIZ_IP`,
 
 ## Architecture
 
-Everything lives under `src/wizctl/`, split strictly by responsibility:
-
-- **`cli.py`** — argparse setup and the async main loop only. Maps each subcommand to a `bulb.py` function and translates exceptions (`WizLightTimeOutError`, `WizLightConnectionError`, `OSError`, `ValueError`, `RuntimeError`) into user-facing errors via `parsers.die()`, returning appropriate exit codes. Contains no bulb-communication or parsing logic itself.
+- **`gui.py`** — Tkinter & Pillow dark-themed graphical control panel. Features an interactive HSV color wheel with real-time dragging and debouncing, white temperature Kelvin controls, scene selectors, brightness sliders, and background live bulb pinging/syncing over an async worker loop.
+- **`state.py`** — persistent state management. Reads/writes last known IP, power, brightness, RGB color, Kelvin, scene, and recent palette colors to `~/.config/wizctl/state.json`.
+- **`cli.py`** — argparse setup and main dispatcher. When invoked without arguments (or with `gui` subcommand, or by double-clicking the binary executable), launches the GUI; otherwise runs the headless CLI subcommands. Maps each subcommand to a `bulb.py` function and translates exceptions (`WizLightTimeOutError`, `WizLightConnectionError`, `OSError`, `ValueError`, `RuntimeError`) into user-facing errors via `parsers.die()`, returning appropriate exit codes.
 - **`bulb.py`** — all `pywizlight` interaction. `get_bulb(ip)` is an async context manager that guarantees `wizlight.async_close()` cleanup; every `command_*` function opens a fresh connection through it rather than holding a long-lived bulb object. Each `command_*` function both performs the action and prints its own `✓ ...` confirmation line — this dual responsibility (side effect + user-facing output) is intentional and mirrored in tests.
 - **`parsers.py`** — pure, synchronous input-parsing functions (`parse_color`, `parse_brightness`, `parse_scene`) that raise `ValueError` on bad input. No I/O, no bulb dependency, fully unit-testable in isolation. `die()` (print to stderr + `sys.exit`) also lives here.
 - **`colors.py`** — static `COLORS: Dict[str, Tuple[int,int,int]]` name→RGB table consumed by `parsers.parse_color`.

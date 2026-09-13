@@ -29,6 +29,8 @@ htmlcov/
 # IDE / Editor files
 .idea/
 .vscode/
+.claude/
+.worktrees/
 *.swp
 *.swo
 

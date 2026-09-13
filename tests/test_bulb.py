@@ -15,6 +15,8 @@ from wizctl.bulb import (
     command_scenes,
     command_status,
     command_toggle,
+    command_wizclick,
+    get_favorites,
     get_status_info,
 )
 
@@ -126,3 +128,86 @@ def test_command_scenes(capsys):
     captured = capsys.readouterr()
     assert "Available WiZ Scenes:" in captured.out
     assert "Sunset" in captured.out
+
+
+@pytest.mark.asyncio
+async def test_get_bulb_invalid_ip():
+    from wizctl.bulb import get_bulb
+    with pytest.raises(ValueError):
+        async with get_bulb("invalid_ip"):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_command_color_tuple(mock_wizlight, capsys):
+    with patch("wizctl.bulb.wizlight", return_value=mock_wizlight):
+        rgb = await command_color("192.168.0.102", (255, 128, 0))
+        assert rgb == (255, 128, 0)
+        assert mock_wizlight.turn_on.called
+        captured = capsys.readouterr()
+        assert "✓ RGB(255, 128, 0)" in captured.out
+
+
+@pytest.mark.asyncio
+async def test_get_favorites(mock_wizlight):
+    with patch("wizctl.bulb.wizlight", return_value=mock_wizlight):
+        favs = await get_favorites("192.168.0.102")
+        assert len(favs) == 2
+        assert favs[0]["mode"] == 1
+        assert favs[0]["scene_id"] == 6
+        assert favs[0]["scene_name"] == "Cozy"
+        assert favs[1]["mode"] == 2
+        assert favs[1]["scene_id"] == 14
+        assert favs[1]["scene_name"] == "Night light"
+
+
+@pytest.mark.asyncio
+async def test_command_wizclick_list(mock_wizlight, capsys):
+    with patch("wizctl.bulb.wizlight", return_value=mock_wizlight):
+        await command_wizclick("192.168.0.102")
+        captured = capsys.readouterr()
+        assert "WiZclick Settings (Wall Switch Modes):" in captured.out
+        assert "Mode 1 (Click 1): Cozy" in captured.out
+        assert "Mode 2 (Click 2): Night light" in captured.out
+
+
+@pytest.mark.asyncio
+async def test_command_wizclick_activate_mode1(mock_wizlight, capsys):
+    with patch("wizctl.bulb.wizlight", return_value=mock_wizlight):
+        sid, sname = await command_wizclick("192.168.0.102", mode=1)
+        assert sid == 6
+        assert sname == "Cozy"
+        assert mock_wizlight.turn_on.called
+        captured = capsys.readouterr()
+        assert "✓ WiZclick Mode 1 (Cozy)" in captured.out
+
+
+@pytest.mark.asyncio
+async def test_command_wizclick_activate_mode2(mock_wizlight, capsys):
+    with patch("wizctl.bulb.wizlight", return_value=mock_wizlight):
+        sid, sname = await command_wizclick("192.168.0.102", mode=2)
+        assert sid == 14
+        assert sname == "Night light"
+        assert mock_wizlight.turn_on.called
+        captured = capsys.readouterr()
+        assert "✓ WiZclick Mode 2 (Night light)" in captured.out
+
+
+@pytest.mark.asyncio
+async def test_command_wizclick_invalid_mode(mock_wizlight):
+    with patch("wizctl.bulb.wizlight", return_value=mock_wizlight):
+        with pytest.raises(ValueError, match="WiZclick mode must be between"):
+            await command_wizclick("192.168.0.102", mode=5)
+
+
+@pytest.mark.asyncio
+async def test_command_toggle_off_to_on(mock_wizlight, capsys):
+    mock_wizlight.updateState.return_value[0].pilotResult["state"] = False
+    with patch("wizctl.bulb.wizlight", return_value=mock_wizlight):
+        new_state = await command_toggle("192.168.0.102")
+        assert new_state is True
+        assert mock_wizlight.turn_on.called
+        captured = capsys.readouterr()
+        assert "✓ ON (toggled)" in captured.out
+
+

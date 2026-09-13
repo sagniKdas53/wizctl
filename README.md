@@ -8,11 +8,16 @@ A fast, lightweight CLI tool and Python library for controlling WiZ Connected sm
 
 ## Features
 
+- **Interactive GUI & Color Wheel**: Double-click the standalone executable or run `wizctl` / `wizctl gui` to open a dark-themed graphical control panel with an interactive HSV color wheel, live dragging, and instant presets.
+- **State Memory**: Automatically remembers and persists your last used IP, power state, brightness, RGB color, Kelvin temperature, and recent palette history in `~/.config/wizctl/state.json`.
+- **Live Bulb Pinging**: Real-time pinging on connect and in the background, displaying live status (Online/Offline, ping latency, RSSI signal strength, MAC address).
 - **Fast Local Control**: Directly controls WiZ bulbs over LAN UDP protocol (no cloud / bridge required).
 - **Comprehensive Controls**: Power (`on`, `off`, `toggle`), brightness, RGB colors, color temperatures (Kelvin), and dynamic WiZ scenes.
 - **Flexible Color Input**: Supports named colors (`warmwhite`, `red`, `cyan`, etc.), 6-digit hex (`#ff5500`), shorthand 3-digit hex (`#f50`), and RGB triples (`255, 128, 0`).
+- **Image palettes**: Extract dominant colors from a photo, then copy a ready-made `wizctl color` command or set a swatch directly.
 - **Scene Presets**: Switch scenes by name (`cozy`, `sunset`, `ocean`, `candlelight`) or ID (`1`-`36`, `40`), and list all scenes with `wizctl scenes`.
-- **Standalone Binary**: Includes a standalone compiled binary executable with zero external runtime dependencies.
+- **WiZclick & Favorites**: Inspect and trigger your physical wall switch settings (Mode 1: Cozy, Mode 2: Night light) directly via CLI (`wizctl wizclick [1|2]`) or with one-click buttons in the GUI.
+- **Live State Reconciliation**: Protects against stale state collisions. When someone flips the wall switch (WiZclick), changes settings in the official mobile app, or an automation (schedules, circadian rhythm, SpaceSense) updates the bulb, `wizctl` verifies live hardware status before modifying power or applying changes to prevent clobbering external state.
 - **Robust Error Handling**: Automatic UDP transport cleanup, timeout detection, and device reachability checks.
 
 ---
@@ -25,12 +30,16 @@ A fast, lightweight CLI tool and Python library for controlling WiZ Connected sm
 │   └── wizctl/
 │       ├── __init__.py      # Package metadata & version
 │       ├── __main__.py      # python -m wizctl entry point
+│       ├── gui.py           # Tkinter GUI with interactive Color Wheel & async worker
+│       ├── state.py         # Persistent state manager (JSON)
 │       ├── cli.py           # CLI argument parsing & commands
 │       ├── bulb.py          # WiZ communication & async connection manager
 │       ├── colors.py        # Named colors dictionary & RGB mappings
 │       └── parsers.py       # Color, brightness, and scene parsers
 ├── tests/
 │   ├── conftest.py          # Pytest fixtures & mocks
+│   ├── test_gui.py          # Unit tests for GUI widgets & interactions
+│   ├── test_state.py        # Unit tests for state persistence
 │   ├── test_parsers.py      # Unit tests for input parsing
 │   ├── test_cli.py          # Unit tests for CLI options & commands
 │   ├── test_bulb.py         # Async unit tests with mocked WiZ device
@@ -66,9 +75,34 @@ Alternatively using the `Makefile`:
 make install-dev
 ```
 
-### 2. Basic Usage
+### 2. Graphical User Interface (GUI)
 
-By default, `wizctl` targets `192.168.0.102` (or the IP configured in `WIZ_IP` / `BULB_IP` environment variables).
+Launch the interactive control panel with color wheel by running `wizctl` with no arguments, running `wizctl gui`, or double-clicking the compiled executable `./dist/wizctl`:
+
+```bash
+# Launch GUI (default when no subcommand is provided)
+wizctl
+
+# Or explicitly launch GUI with custom target IP
+wizctl --ip 192.168.1.50 gui
+
+# Or run the standalone executable directly
+./dist/wizctl
+```
+
+The GUI includes:
+- **Interactive HSV Color Wheel**: Click & drag on the wheel to manipulate colors with smooth real-time visual feedback and debounced network commands.
+- **Image Palette Picker**: Drag and drop an image file or click "Select Image..." to automatically extract dominant color swatches, view dominance percentages, and click any swatch to apply it directly to the bulb.
+- **State Memory**: Persists your last known IP, power, brightness, RGB, Kelvin, and custom recent palette colors across sessions.
+- **Live Bulb Pinging**: Pings the bulb on startup, on IP edit, and periodically in the background to show live power state, latency (ms), RSSI signal strength (dBm), and MAC address.
+- **One-Click Power Toggle**: Large toggle button showing live bulb power state.
+- **Brightness Slider**: 1-255 / 0%-100% slider with quick preset buttons (10%, 25%, 50%, 75%, 100%).
+- **White Temperature (Kelvin)**: 2200K - 6500K slider and quick temperature presets (Candle, Warm, Neutral, Daylight).
+- **Scene Grid**: Quick access to popular WiZ light scenes (Cozy, Sunset, Ocean, Candlelight, Forest, etc.).
+
+### 3. CLI Usage
+
+By default, `wizctl` CLI commands target `192.168.0.102` (or the IP configured in `WIZ_IP` / `BULB_IP` environment variables).
 
 ```bash
 # Check bulb status
@@ -89,6 +123,12 @@ wizctl color #ff5500
 wizctl color "255, 128, 0"
 wizctl color warmwhite
 
+# Open the color picker, then use Up/Down and Enter to send a color.
+wizctl palette ./photo.jpg
+
+# Use palette color 2 immediately.
+wizctl palette ./photo.jpg --apply 2
+
 # Set color temperature in Kelvin (2200K - 6500K)
 wizctl kelvin 2700
 wizctl kelvin 4000
@@ -97,6 +137,11 @@ wizctl kelvin 4000
 wizctl scene cozy
 wizctl scene sunset
 wizctl scene 1
+
+# Inspect WiZclick wall switch modes or trigger Mode 1 (Cozy) / Mode 2 (Night light)
+wizctl wizclick
+wizctl wizclick 1
+wizctl wizclick 2
 
 # List all available WiZ scenes
 wizctl scenes
@@ -107,7 +152,7 @@ wizctl scenes
 ## CLI Reference
 
 ```
-usage: wizctl [-h] [-v] [--ip IP] {on,off,toggle,status,color,brightness,kelvin,scene,scenes} ...
+usage: wizctl [-h] [-v] [--ip IP] {on,off,toggle,status,color,palette,brightness,kelvin,scene,scenes} ...
 
 positional arguments:
   on                    turn the bulb on
@@ -115,6 +160,7 @@ positional arguments:
   toggle                toggle bulb power state
   status                show bulb status
   color                 set RGB color (name, #RRGGBB, #RGB, or R,G,B)
+  palette               extract dominant colors from an image
   brightness            set brightness (0-255 or 0%-100%)
   kelvin                set color temperature in Kelvin (e.g. 2700, 4000)
   scene                 set WiZ scene preset by name or ID (e.g. cozy, sunset, 1)
@@ -133,6 +179,32 @@ You can target a specific bulb using any of the following methods:
 1. **CLI Flag**: `wizctl --ip 192.168.0.102 status`
 2. **Environment Variable**: `export WIZ_IP=192.168.0.102` or `export BULB_IP=192.168.0.102`
 3. **Default Config**: Default fallback is `192.168.0.102`.
+
+### Image palettes
+
+`wizctl palette` works with image formats Pillow can read, including JPEG, PNG, WebP, GIF, and TIFF. In a normal terminal it opens a picker with real color swatches. Use Up and Down to select a swatch, then Enter to send it to the bulb. Press `q` or Esc to leave without changing the bulb.
+
+```bash
+# Through the installed command
+wizctl palette IMG_4392.JPG
+
+# Keep the old copy-paste output, useful for scripts and pipes
+wizctl palette IMG_4392.JPG --plain
+
+# Run the checkout helper without installing the package
+./.venv/bin/python scripts/extract_palette.py IMG_4392.JPG --colors 8
+
+# Or use the Make target
+make palette IMAGE=IMG_4392.JPG
+
+# Send the third extracted color to a specific bulb
+wizctl --ip 192.168.0.50 palette IMG_4392.JPG --apply 3
+
+# The helper also accepts --ip when applying a swatch
+./.venv/bin/python scripts/extract_palette.py --ip 192.168.0.50 IMG_4392.JPG --apply 3
+```
+
+`--colors` accepts 1 through 16. `--apply NUMBER` sends a numbered swatch without opening the picker. `--plain` disables the picker, while `--tui` forces it when a compatible terminal is available.
 
 ---
 

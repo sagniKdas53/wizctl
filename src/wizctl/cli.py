@@ -19,7 +19,10 @@ from wizctl.bulb import (
     command_scenes,
     command_status,
     command_toggle,
+    command_wizclick,
 )
+from wizctl.palette import PaletteError, extract_palette, format_palette
+from wizctl.palette_tui import PaletteTuiError, choose_palette_color, supports_tui
 from wizctl.parsers import die
 
 
@@ -44,9 +47,17 @@ def create_parser() -> argparse.ArgumentParser:
 
     sub = parser.add_subparsers(
         dest="command",
-        required=True,
+        required=False,
     )
 
+    sub.add_parser("gui", help="open the graphical control panel (default)")
+    widget = sub.add_parser("widget", help="open the compact panel control widget")
+    widget.add_argument(
+        "--click",
+        action="store_true",
+        help="handle panel click with double-click toggle / single-click widget detection",
+    )
+    sub.add_parser("genmon", help="output XML status block for xfce4-genmon-plugin")
     sub.add_parser("on", help="turn the bulb on")
     sub.add_parser("off", help="turn the bulb off")
     sub.add_parser("toggle", help="toggle bulb power state")
@@ -56,6 +67,31 @@ def create_parser() -> argparse.ArgumentParser:
     color.add_argument(
         "value",
         help="color name (e.g. red, cyan, warmwhite), hex (#ff5500, #f50), or RGB (255,128,0)",
+    )
+
+    palette = sub.add_parser("palette", help="extract dominant colors from an image")
+    palette.add_argument("image", help="path to an image file")
+    palette.add_argument(
+        "--colors",
+        type=int,
+        default=6,
+        help="number of colors to extract, from 1 to 16 (default: 6)",
+    )
+    palette.add_argument(
+        "--apply",
+        type=int,
+        metavar="NUMBER",
+        help="set the numbered palette color on the bulb",
+    )
+    palette.add_argument(
+        "--plain",
+        action="store_true",
+        help="print the palette instead of opening the interactive picker",
+    )
+    palette.add_argument(
+        "--tui",
+        action="store_true",
+        help="open the interactive palette picker",
     )
 
     brightness = sub.add_parser("brightness", help="set brightness")
@@ -79,6 +115,18 @@ def create_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("scenes", help="list all available WiZ scenes")
 
+    wizclick = sub.add_parser(
+        "wizclick",
+        help="view or trigger WiZclick wall switch modes (Cozy / Night light)",
+    )
+    wizclick.add_argument(
+        "mode",
+        nargs="?",
+        type=int,
+        choices=[1, 2],
+        help="WiZclick mode to trigger (1 for 1st click, 2 for 2nd quick click)",
+    )
+
     return parser
 
 
@@ -89,6 +137,20 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
 
     ip = args.ip
 
+    if args.command is None or args.command == "gui":
+        from wizctl.gui import run_gui
+        return run_gui(target_ip=ip)
+
+    if args.command == "widget":
+        from wizctl.widget import handle_panel_click, run_widget
+        if args.click:
+            return handle_panel_click(target_ip=ip)
+        return run_widget(target_ip=ip)
+
+    if args.command == "genmon":
+        from wizctl.genmon import run_genmon
+        return run_genmon(target_ip=ip)
+
     try:
         if args.command == "on":
             await command_on(ip)
@@ -98,8 +160,25 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
             await command_toggle(ip)
         elif args.command == "status":
             await command_status(ip)
+        elif args.command == "wizclick":
+            await command_wizclick(ip, args.mode)
         elif args.command == "color":
             await command_color(ip, args.value)
+        elif args.command == "palette":
+            palette = extract_palette(args.image, args.colors)
+            if args.apply is not None:
+                if not 1 <= args.apply <= len(palette):
+                    raise ValueError(
+                        f"palette choice must be between 1 and {len(palette)}"
+                    )
+                print(format_palette(args.image, palette))
+                await command_color(ip, palette[args.apply - 1].hex)
+            elif args.tui or (not args.plain and supports_tui()):
+                color = choose_palette_color(args.image, palette, ip)
+                if color is not None:
+                    await command_color(ip, color.hex)
+            else:
+                print(format_palette(args.image, palette))
         elif args.command == "brightness":
             await command_brightness(ip, args.value)
         elif args.command == "kelvin":
@@ -119,7 +198,7 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
     except OSError as exc:
         die(f"network error: {exc}")
         return 1
-    except ValueError as exc:
+    except (PaletteError, PaletteTuiError, ValueError) as exc:
         die(str(exc))
         return 1
     except RuntimeError as exc:
@@ -135,6 +214,11 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
 def main(argv: Optional[List[str]] = None) -> int:
     """Synchronous CLI entry point returning exit code."""
     try:
+        parser = create_parser()
+        args = parser.parse_args(argv)
+        if args.command is None or args.command == "gui":
+            from wizctl.gui import run_gui
+            return run_gui(target_ip=args.ip)
         return asyncio.run(async_main(argv))
     except KeyboardInterrupt:
         return 130
