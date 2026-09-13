@@ -121,6 +121,57 @@ pub fn kelvin_to_rgb(kelvin: u16) -> (u8, u8, u8) {
     (red.round() as u8, green.round() as u8, blue.round() as u8)
 }
 
+/// Convert sRGB bytes to HSV with hue in degrees `[0, 360)` and s/v in `[0, 1]`.
+pub fn rgb_to_hsv(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
+    let rf = r as f32 / 255.0;
+    let gf = g as f32 / 255.0;
+    let bf = b as f32 / 255.0;
+
+    let max = rf.max(gf).max(bf);
+    let min = rf.min(gf).min(bf);
+    let delta = max - min;
+
+    let hue = if delta <= f32::EPSILON {
+        0.0
+    } else if max == rf {
+        60.0 * (((gf - bf) / delta) % 6.0)
+    } else if max == gf {
+        60.0 * (((bf - rf) / delta) + 2.0)
+    } else {
+        60.0 * (((rf - gf) / delta) + 4.0)
+    };
+
+    let hue = if hue < 0.0 { hue + 360.0 } else { hue };
+    let sat = if max <= f32::EPSILON { 0.0 } else { delta / max };
+    (hue, sat, max)
+}
+
+/// Convert HSV (hue in degrees, s/v in `[0, 1]`) to sRGB bytes.
+pub fn hsv_to_rgb(hue: f32, sat: f32, val: f32) -> (u8, u8, u8) {
+    let h = hue.rem_euclid(360.0);
+    let s = sat.clamp(0.0, 1.0);
+    let v = val.clamp(0.0, 1.0);
+
+    let c = v * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let m = v - c;
+
+    let (rf, gf, bf) = match h as u32 / 60 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+
+    (
+        ((rf + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((gf + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((bf + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+    )
+}
+
 pub fn parse_color(value: &str) -> Result<(u8, u8, u8), String> {
     let val = value.trim().to_lowercase();
     if val.is_empty() {
@@ -296,5 +347,32 @@ mod tests {
         assert_eq!(r, 255);
         assert!(g > 150 && g < 185);
         assert!(b > 70 && b < 100);
+    }
+
+    #[test]
+    fn test_hsv_roundtrip_preserves_color() {
+        for &(r, g, b) in &[
+            (255u8, 0u8, 0u8),
+            (0, 255, 0),
+            (0, 0, 255),
+            (18, 200, 137),
+            (240, 240, 240),
+            (0, 0, 0),
+        ] {
+            let (h, s, v) = rgb_to_hsv(r, g, b);
+            let (r2, g2, b2) = hsv_to_rgb(h, s, v);
+            assert!(
+                (r as i32 - r2 as i32).abs() <= 1
+                    && (g as i32 - g2 as i32).abs() <= 1
+                    && (b as i32 - b2 as i32).abs() <= 1,
+                "roundtrip drifted: {r},{g},{b} -> {r2},{g2},{b2}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_hsv_hue_wraps_at_360() {
+        assert_eq!(hsv_to_rgb(360.0, 1.0, 1.0), hsv_to_rgb(0.0, 1.0, 1.0));
+        assert_eq!(hsv_to_rgb(-60.0, 1.0, 1.0), hsv_to_rgb(300.0, 1.0, 1.0));
     }
 }

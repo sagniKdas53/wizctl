@@ -39,21 +39,37 @@ A high-performance native Rust application and smart desktop popover widget for 
 
 ```
 wizctl/
-├── Cargo.toml           # Rust package definition and dependencies (eframe, serde)
+├── Cargo.toml           # Rust package definition and dependencies (eframe, serde, image)
 ├── Makefile             # Build, install, test, and panel setup targets
 ├── src/
 │   ├── lib.rs           # Core library module exports
-│   ├── main.rs          # CLI dispatcher, single-instance PID guard, run_gui
-│   ├── ui.rs            # egui Popover: Power pill, Brightness slider, Kelvin slider, Scenes, Palette
+│   ├── main.rs          # CLI dispatcher, panel click handling, subcommand routing
+│   ├── ui.rs            # Compact popover: power banner, brightness/Kelvin presets, scenes,
+│   │                    #   quick colors, image drag & drop
+│   ├── studio.rs        # Full studio window: color wheel, Kelvin, scene browser, image palette
+│   ├── theme.rs         # Shared dark palette and hand-painted widget atoms (no icon fonts)
+│   ├── worker.rs        # Background UDP command pump with coalescing and ping backoff
+│   ├── palette.rs       # Median-cut dominant color extraction from images
 │   ├── bulb.rs          # Pure Rust WiZ UDP protocol (JSON-RPC on port 38899)
 │   ├── state.rs         # Local state cache (~/.config/wizctl/state.json)
-│   ├── colors.rs        # Preset colors, scene definitions, and Kelvin-to-RGB conversion
+│   ├── colors.rs        # Preset colors, scene definitions, Kelvin/HSV conversions
 │   └── genmon.rs        # XFCE4 Genmon XML status provider with embedded icons
 ├── assets/              # Lightbulb panel icons (on, off, offline, and app icons)
 ├── scripts/
 │   └── setup_panel_widget.sh # Installs launcher desktop files and reloads xfce4-panel
-└── tests/               # Integration tests (UDP mock server, colors, state, genmon)
+└── tests/               # Integration tests (UDP mock server, colors, state, genmon, palette)
 ```
+
+---
+
+## Two Surfaces
+
+| | `wizctl widget` (default) | `wizctl studio` (alias `wizctl gui`) |
+|---|---|---|
+| **Window** | Frameless popover anchored at the cursor | Frameless resizable window with a painted titlebar (drag to move, double-click to maximize) and egui resize grips |
+| **Dismissal** | Click-away, `Escape`, or panel re-click | Titlebar close button |
+| **Controls** | Power banner, brightness slider + 25/50/75/100% chips, Kelvin gradient slider + 2200/2700/4000/6500K chips, Cozy/Sunset/Ocean/Night scenes, quick color dots, inline custom color picker | Everything in the widget plus an IP/ping bar, HSV color wheel, full scene browser, and the image palette tab |
+| **Image palette** | Drop an image on the popover to replace the quick colors with its dominant colors | Drop an image or use `Select Image...`, with thumbnail, dominance percentages and 4/6/8/12 color counts |
 
 ---
 
@@ -85,10 +101,13 @@ make install
 By default, `wizctl` targets `192.168.0.102` (or the IP configured in `WIZ_IP` / `BULB_IP` environment variables or `~/.config/wizctl/state.json`). You can also pass `--ip <IP>`.
 
 ```bash
-# Launch the desktop popover widget (default)
+# Launch the compact desktop popover widget (default)
 wizctl
 wizctl widget
+
+# Launch the full studio window (color wheel, Kelvin, scenes, image palette)
 wizctl gui
+wizctl studio
 
 # Check bulb status
 wizctl status
@@ -108,7 +127,7 @@ wizctl color #ff5500
 wizctl color "255, 128, 0"
 wizctl color warmwhite
 
-# Set color temperature in Kelvin (2700K - 6500K)
+# Set color temperature in Kelvin (2200K - 6500K)
 wizctl kelvin 2700
 wizctl kelvin 4000K
 

@@ -3,7 +3,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::colors::{get_scene_name, parse_brightness, parse_color, parse_kelvin, parse_scene, rgb_to_hex, SCENES};
+use crate::colors::{
+    get_scene_name, hsv_to_rgb, parse_brightness, parse_color, parse_kelvin, parse_scene,
+    rgb_to_hex, SCENES,
+};
 use crate::state::{validate_ip, State};
 
 pub const WIZ_PORT: u16 = 38899;
@@ -21,6 +24,10 @@ pub struct PilotResult {
     pub r: Option<u8>,
     pub g: Option<u8>,
     pub b: Option<u8>,
+    /// Warm-white channel; carries the desaturated part of an RGB pick.
+    pub w: Option<u8>,
+    /// Cold-white channel.
+    pub c: Option<u8>,
     pub src: Option<String>,
 }
 
@@ -35,11 +42,30 @@ impl PilotResult {
         })
     }
 
+    /// The bulb's displayed color, folding the warm-white channel back in.
+    ///
+    /// `setPilot` splits a color across the RGB LEDs and the white LED (see
+    /// [`rgb_to_rgbcw`]), so the raw `r`/`g`/`b` read back from the bulb is the
+    /// saturated remainder, not the color the user picked. Without this inverse
+    /// a warm off-white reads back as a dark orange.
     pub fn rgb(&self) -> Option<(u8, u8, u8)> {
         match (self.r, self.g, self.b) {
-            (Some(r), Some(g), Some(b)) => Some((r, g, b)),
+            // All channels dark means the bulb is in white/scene mode and is
+            // reporting no color at all, not the color black.
+            (Some(0), Some(0), Some(0)) if self.w.unwrap_or(0) == 0 => None,
+            (Some(r), Some(g), Some(b)) => Some(rgbcw_to_rgb(r, g, b, self.w.unwrap_or(0))),
             _ => None,
         }
+    }
+
+    /// Whether the bulb's raw channels are exactly what `rgb` would have sent.
+    ///
+    /// The RGB/white split is lossy in brightness, so a readback of a color we
+    /// just set does not reproduce the original hex. Comparing in channel space
+    /// instead keeps the UI from drifting the user's pick after the confirm poll.
+    pub fn matches_rgb(&self, rgb: [u8; 3]) -> bool {
+        let ((r, g, b), w) = rgb_to_rgbcw(rgb[0], rgb[1], rgb[2]);
+        self.r == Some(r) && self.g == Some(g) && self.b == Some(b) && self.w.unwrap_or(0) == w
     }
 
     pub fn scene_name(&self) -> Option<&'static str> {
@@ -146,12 +172,131 @@ pub fn set_brightness(ip: &str, brightness: u8) -> Result<(), Box<dyn std::error
 }
 
 pub fn set_temperature(ip: &str, kelvin: u16) -> Result<(), Box<dyn std::error::Error>> {
-    let temp = kelvin.clamp(2700, 6500);
+    let temp = kelvin.clamp(2200, 6500);
     send_pilot(ip, json!({ "state": true, "temp": temp }))
 }
 
+/// Convert an sRGB triple into the WiZ five-channel mix (`r`,`g`,`b` + warm white).
+///
+/// A WiZ RGBTW bulb renders desaturated colors through its dedicated white LED,
+/// not by driving the RGB LEDs toward white. Sending raw sRGB leaves the white
+/// channels at whatever the previous command set, so a warm off-white lands as
+/// a cold bluish wash. This is a direct port of `pywizlight`'s
+/// `rgbcw.rgb2rgbcw`, which is the conversion the Python CLI/GUI has always used.
+pub fn rgb_to_rgbcw(r: u8, g: u8, b: u8) -> ((u8, u8, u8), u8) {
+    const EPSILON: f64 = 1.0e-5;
+    /// Highest value the warm-white channel is driven to.
+    const CW_MAX: f64 = 128.0;
+    /// Unit vectors 120° apart, one per RGB primary.
+    const BASIS: [(f64, f64); 3] = [
+        (1.0, 0.0),
+        (-0.5, 0.866_025_403_784_438_6),
+        (-0.5, -0.866_025_403_784_438_6),
+    ];
+
+    let dot = |a: (f64, f64), b: (f64, f64)| a.0 * b.0 + a.1 * b.1;
+
+    // Project the color onto the hue plane; the projection's length is saturation.
+    let (rf, gf, bf) = (r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0);
+    let mut hue = (
+        BASIS[0].0 * rf + BASIS[1].0 * gf + BASIS[2].0 * bf,
+        BASIS[0].1 * rf + BASIS[1].1 * gf + BASIS[2].1 * bf,
+    );
+    let len_sq = dot(hue, hue);
+    let saturation = if len_sq > EPSILON { len_sq.sqrt() } else { 0.0 };
+    if saturation > EPSILON {
+        hue = (hue.0 / saturation, hue.1 / saturation);
+    }
+
+    let mut rgb = [0.0_f64; 3];
+    if saturation > EPSILON {
+        // Pick the one or two primaries that can reach this hue.
+        let max_angle = (std::f64::consts::TAU / 3.0 - EPSILON).cos();
+        let mask = [
+            dot(hue, BASIS[0]) > max_angle,
+            dot(hue, BASIS[1]) > max_angle,
+            dot(hue, BASIS[2]) > max_angle,
+        ];
+        let picked: Vec<usize> = (0..3).filter(|&i| mask[i]).collect();
+
+        if picked.len() == 1 {
+            rgb[picked[0]] = 1.0;
+        } else if picked.len() == 2 {
+            let (first, second) = (BASIS[picked[0]], BASIS[picked[1]]);
+            // Ray/line intersection against the line through `second`.
+            let ab = (second.1, -second.0);
+            let coeff0 = dot(hue, ab) / dot(first, ab);
+            let intersection = (first.0 * -coeff0 + hue.0, first.1 * -coeff0 + hue.1);
+            let coeff1 = dot(intersection, second);
+            // Colors outside the basis hexagon are unreachable; rescale into gamut.
+            let max_coeff = coeff0.max(coeff1);
+            rgb[picked[0]] = (coeff0 / max_coeff).min(1.0);
+            rgb[picked[1]] = (coeff1 / max_coeff).min(1.0);
+        }
+    }
+
+    // Discontinuous split: above half saturation the RGB LEDs stay saturated and
+    // the white channel fades out; below it the white channel saturates instead.
+    let cw = if saturation >= 0.5 {
+        1.0 - (saturation - 0.5) * 2.0
+    } else {
+        for channel in &mut rgb {
+            *channel *= saturation * 2.0;
+        }
+        1.0
+    };
+
+    (
+        (
+            (rgb[0] * 255.0) as u8,
+            (rgb[1] * 255.0) as u8,
+            (rgb[2] * 255.0) as u8,
+        ),
+        (cw * CW_MAX).max(0.0) as u8,
+    )
+}
+
+/// Inverse of [`rgb_to_rgbcw`]: recover the displayed color from the bulb's
+/// five channels. Port of `pywizlight`'s `rgbcw.rgbcw2hs`, then HSV at full value.
+pub fn rgbcw_to_rgb(r: u8, g: u8, b: u8, w: u8) -> (u8, u8, u8) {
+    const EPSILON: f64 = 1.0e-5;
+    const CW_MAX: f64 = 128.0;
+    const BASIS: [(f64, f64); 3] = [
+        (1.0, 0.0),
+        (-0.5, 0.866_025_403_784_438_6),
+        (-0.5, -0.866_025_403_784_438_6),
+    ];
+
+    let (rf, gf, bf) = (r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0);
+    let cw = (w as f64).min(CW_MAX) / CW_MAX;
+    let hue_vec = (
+        BASIS[0].0 * rf + BASIS[1].0 * gf + BASIS[2].0 * bf,
+        BASIS[0].1 * rf + BASIS[1].1 * gf + BASIS[2].1 * bf,
+    );
+
+    // Mirror of the forward split: a saturated white channel means the RGB LEDs
+    // encode the lower half of the saturation range, otherwise they are maxed
+    // out and the white channel encodes the upper half.
+    let len_sq = hue_vec.0 * hue_vec.0 + hue_vec.1 * hue_vec.1;
+    let saturation = if cw >= 1.0 {
+        let len = if len_sq > EPSILON { len_sq.sqrt() } else { 0.0 };
+        len * 0.5
+    } else {
+        1.0 - cw / 2.0
+    };
+
+    let hue = hue_vec.1.atan2(hue_vec.0).to_degrees().rem_euclid(360.0);
+    hsv_to_rgb(hue as f32, saturation as f32, 1.0)
+}
+
+/// `setPilot` parameters for an RGB pick, white channel included.
+pub fn rgb_pilot_params(r: u8, g: u8, b: u8) -> serde_json::Value {
+    let ((pr, pg, pb), w) = rgb_to_rgbcw(r, g, b);
+    json!({ "state": true, "r": pr, "g": pg, "b": pb, "w": w })
+}
+
 pub fn set_rgb(ip: &str, r: u8, g: u8, b: u8) -> Result<(), Box<dyn std::error::Error>> {
-    send_pilot(ip, json!({ "state": true, "r": r, "g": g, "b": b }))
+    send_pilot(ip, rgb_pilot_params(r, g, b))
 }
 
 pub fn set_scene(ip: &str, scene_id: u32) -> Result<(), Box<dyn std::error::Error>> {
@@ -168,10 +313,14 @@ pub fn apply_saved_state(ip: &str, state: &State) -> Result<(), Box<dyn std::err
     if state.mode == "scene" && state.scene_id > 0 {
         send_pilot(ip, json!({ "state": true, "dimming": dim, "sceneId": state.scene_id }))?;
     } else if state.mode == "kelvin" && state.kelvin > 0 {
-        let temp = state.kelvin.clamp(2700, 6500);
+        let temp = state.kelvin.clamp(2200, 6500);
         send_pilot(ip, json!({ "state": true, "dimming": dim, "temp": temp }))?;
     } else {
-        send_pilot(ip, json!({ "state": true, "dimming": dim, "r": state.rgb[0], "g": state.rgb[1], "b": state.rgb[2] }))?;
+        let ((pr, pg, pb), w) = rgb_to_rgbcw(state.rgb[0], state.rgb[1], state.rgb[2]);
+        send_pilot(
+            ip,
+            json!({ "state": true, "dimming": dim, "r": pr, "g": pg, "b": pb, "w": w }),
+        )?;
     }
     Ok(())
 }

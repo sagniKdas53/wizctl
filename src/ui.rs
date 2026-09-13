@@ -1,51 +1,62 @@
+//! Compact panel popover widget.
+//!
+//! Ephemeral by design: the process exits when the popover closes, so idle RAM
+//! and file descriptors drop to zero. See `WIZCTL_RUST_REWRITE_PLAN.md`.
+
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use eframe::egui::{self, Color32, CornerRadius, Pos2, Rect, Sense, Stroke, Vec2, ViewportBuilder, ViewportCommand, X11WindowType};
+use eframe::egui::{
+    self, Align, Align2, Color32, CornerRadius, FontId, Layout, Pos2, Sense, Stroke, Vec2,
+    ViewportBuilder, ViewportCommand, X11WindowType,
+};
 
-use crate::bulb::{get_pilot, set_brightness, set_power, set_rgb, set_scene, set_temperature, PilotResult};
 use crate::colors::{kelvin_to_rgb, parse_color, rgb_to_hex};
+use crate::palette::{extract_palette, is_supported_image, PaletteColor};
 use crate::state::{load_state, save_state, State};
+use crate::theme;
+use crate::worker::{BulbWorker, Cmd, Event};
 
-// ---------------------------------------------------------------------------
-// Theme Palette (Matching XFCE charcoal and dark slate)
-// ---------------------------------------------------------------------------
-pub const COLOR_BG: Color32 = Color32::from_rgb(48, 49, 51);         // #303133 (XFCE dark charcoal)
-pub const COLOR_BORDER: Color32 = Color32::from_rgb(32, 33, 35);     // #202123
-pub const COLOR_ACCENT_BLUE: Color32 = Color32::from_rgb(17, 124, 221);// #117cdd (Solid highlight)
-pub const COLOR_TRACK_BLUE: Color32 = Color32::from_rgb(24, 115, 204); // #1873cc (Active slider/toggle)
-pub const COLOR_TRACK_BG: Color32 = Color32::from_rgb(60, 61, 63);   // #3c3d3f (Trough)
-pub const COLOR_SWITCH_KNOB: Color32 = Color32::from_rgb(58, 60, 62);// #3a3c3e
-pub const COLOR_SWITCH_OFF: Color32 = Color32::from_rgb(52, 53, 55);
-pub const COLOR_TEXT_PRIMARY: Color32 = Color32::from_rgb(235, 235, 235);
-pub const COLOR_TEXT_MUTED: Color32 = Color32::from_rgb(160, 162, 165);
+/// Quick scene chips, mirroring the Python widget's `QUICK_SCENES`.
+const QUICK_SCENES: &[(&str, u32)] = &[("Cozy", 6), ("Sunset", 3), ("Ocean", 1), ("Night", 14)];
 
-const QUICK_SCENES: &[(u32, &str)] = &[
-    (6, "Cozy"),
-    (11, "Warm White"),
-    (12, "Daylight"),
-    (3, "Sunset"),
-    (14, "Night Light"),
-    (4, "Party"),
+/// White temperature chips, mirroring the Python widget's `QUICK_KELVIN`.
+const QUICK_KELVIN: &[(&str, u16)] = &[
+    ("2200K", 2200),
+    ("2700K", 2700),
+    ("4000K", 4000),
+    ("6500K", 6500),
 ];
 
+/// Brightness chips, mirroring the Python widget's quick brightness row.
+const QUICK_BRIGHTNESS: &[(&str, u8)] = &[("25%", 64), ("50%", 128), ("75%", 191), ("100%", 255)];
+
+const WIN_W: f32 = 340.0;
+const BASE_H: f32 = 444.0;
+const PICKER_H: f32 = 238.0;
+const PALETTE_ROW_H: f32 = 20.0;
+
 // ---------------------------------------------------------------------------
-// Pillar 4: Single-Instance PID Guard & Debounce Latch
+// Single-instance PID guard & debounce latch
 // ---------------------------------------------------------------------------
 pub struct PidGuard;
+
 impl Drop for PidGuard {
     fn drop(&mut self) {
         let _ = fs::remove_file("/tmp/wizctl_gui.pid");
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let _ = fs::write("/tmp/wizctl_closed_stamp", format!("{now}"));
+        let _ = fs::write("/tmp/wizctl_closed_stamp", format!("{}", now_millis()));
     }
+}
+
+fn now_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
 }
 
 pub fn check_single_instance() -> Option<PidGuard> {
@@ -56,12 +67,8 @@ pub fn check_single_instance() -> Option<PidGuard> {
                 if Path::new(&format!("/proc/{pid}")).exists() {
                     let _ = Command::new("kill").arg(format!("{pid}")).status();
                     let _ = fs::remove_file(pid_file);
-                    let now = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map(|d| d.as_millis())
-                        .unwrap_or(0);
-                    let _ = fs::write("/tmp/wizctl_closed_stamp", format!("{now}"));
-                    return None; // Toggled off!
+                    let _ = fs::write("/tmp/wizctl_closed_stamp", format!("{}", now_millis()));
+                    return None; // Toggled off.
                 }
             }
         }
@@ -71,25 +78,20 @@ pub fn check_single_instance() -> Option<PidGuard> {
     if stamp_file.exists() {
         if let Ok(content) = fs::read_to_string(stamp_file) {
             if let Ok(last_closed) = content.trim().parse::<u128>() {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_millis())
-                    .unwrap_or(0);
-                if now.saturating_sub(last_closed) < 250 {
+                if now_millis().saturating_sub(last_closed) < 250 {
                     let _ = fs::remove_file(stamp_file);
-                    return None; // Stay closed (debounce latch)
+                    return None; // Debounce latch: stay closed.
                 }
             }
         }
     }
 
-    let my_pid = std::process::id();
-    let _ = fs::write(pid_file, format!("{my_pid}"));
+    let _ = fs::write(pid_file, format!("{}", std::process::id()));
     Some(PidGuard)
 }
 
 // ---------------------------------------------------------------------------
-// Pillar 2: Dynamic Cursor-Anchored Placement
+// Cursor-anchored placement
 // ---------------------------------------------------------------------------
 pub fn get_mouse_position() -> (f32, f32) {
     if let Ok(out) = Command::new("xdotool").arg("getmouselocation").output() {
@@ -113,248 +115,152 @@ pub fn get_mouse_position() -> (f32, f32) {
 }
 
 // ---------------------------------------------------------------------------
-// Worker Messages & Asynchronous Backend Client
+// Dropped-image palette
 // ---------------------------------------------------------------------------
-enum WorkerCmd {
-    SetPower(bool),
-    SetBrightness(u8),
-    SetKelvin(u16),
-    SetRgb(u8, u8, u8),
-    SetScene(u32),
+struct DroppedPalette {
+    name: String,
+    colors: Vec<PaletteColor>,
 }
 
-enum WorkerEvent {
-    BulbOnline(PilotResult),
-    BulbOffline,
-}
-
-struct AsyncBulbWorker {
-    tx: Sender<WorkerCmd>,
-    rx: Receiver<WorkerEvent>,
-}
-
-impl AsyncBulbWorker {
-    fn new(ip: String) -> Self {
-        let (cmd_tx, cmd_rx) = channel::<WorkerCmd>();
-        let (event_tx, event_rx) = channel::<WorkerEvent>();
-
-        thread::spawn(move || {
-            // Initial probe
-            if let Ok(pilot) = get_pilot(&ip) {
-                let _ = event_tx.send(WorkerEvent::BulbOnline(pilot));
-            } else {
-                let _ = event_tx.send(WorkerEvent::BulbOffline);
-            }
-
-            // Command loop with debouncing
-            while let Ok(cmd) = cmd_rx.recv() {
-                // Drain rapid redundant commands
-                let mut latest_cmd = cmd;
-                while let Ok(next) = cmd_rx.try_recv() {
-                    match (&latest_cmd, &next) {
-                        (WorkerCmd::SetBrightness(_), WorkerCmd::SetBrightness(_)) => {
-                            latest_cmd = next;
-                        }
-                        (WorkerCmd::SetKelvin(_), WorkerCmd::SetKelvin(_)) => {
-                            latest_cmd = next;
-                        }
-                        (WorkerCmd::SetRgb(_, _, _), WorkerCmd::SetRgb(_, _, _)) => {
-                            latest_cmd = next;
-                        }
-                        _ => {
-                            execute_cmd(&ip, &latest_cmd);
-                            latest_cmd = next;
-                        }
-                    }
-                }
-
-                execute_cmd(&ip, &latest_cmd);
-            }
-        });
-
-        Self { tx: cmd_tx, rx: event_rx }
-    }
-
-    fn send(&self, cmd: WorkerCmd) {
-        let _ = self.tx.send(cmd);
-    }
-
-    fn try_recv(&self) -> Option<WorkerEvent> {
-        self.rx.try_recv().ok()
-    }
-}
-
-fn execute_cmd(ip: &str, cmd: &WorkerCmd) {
-    match cmd {
-        WorkerCmd::SetPower(st) => {
-            let _ = set_power(ip, *st);
-        }
-        WorkerCmd::SetBrightness(b) => {
-            let _ = set_brightness(ip, *b);
-        }
-        WorkerCmd::SetKelvin(k) => {
-            let _ = set_temperature(ip, *k);
-        }
-        WorkerCmd::SetRgb(r, g, b) => {
-            let _ = set_rgb(ip, *r, *g, *b);
-        }
-        WorkerCmd::SetScene(sid) => {
-            let _ = set_scene(ip, *sid);
-        }
-    }
+#[derive(PartialEq)]
+enum Link {
+    Pinging,
+    Online,
+    Offline,
 }
 
 // ---------------------------------------------------------------------------
-// Vector Painter Helper Widgets
-// ---------------------------------------------------------------------------
-pub fn draw_pill_toggle(ui: &mut egui::Ui, state: &mut bool) -> bool {
-    let desired_size = Vec2::new(42.0_f32, 22.0_f32);
-    let (rect, mut response) = ui.allocate_exact_size(desired_size, Sense::click());
-    let mut changed = false;
-
-    if response.clicked() {
-        *state = !*state;
-        response.mark_changed();
-        changed = true;
-    }
-
-    if ui.is_rect_visible(rect) {
-        let painter = ui.painter();
-        let bg_fill = if *state { COLOR_TRACK_BLUE } else { COLOR_SWITCH_OFF };
-        painter.rect_filled(rect, CornerRadius::same(11), bg_fill);
-
-        let knob_radius = 8.5_f32;
-        let knob_x = if *state {
-            rect.right() - knob_radius - 2.5_f32
-        } else {
-            rect.left() + knob_radius + 2.5_f32
-        };
-        let knob_center = Pos2::new(knob_x, rect.center().y);
-        painter.circle_filled(knob_center, knob_radius, COLOR_SWITCH_KNOB);
-        painter.circle_stroke(
-            knob_center,
-            knob_radius,
-            Stroke::new(1.0_f32, Color32::from_rgb(38, 40, 42)),
-        );
-    }
-    changed
-}
-
-pub fn draw_lightbulb_icon(
-    painter: &egui::Painter,
-    center: Pos2,
-    radius: f32,
-    is_on: bool,
-    glow_color: Color32,
-) {
-    if is_on {
-        // Soft outer glow
-        painter.circle_filled(center, radius * 1.5_f32, glow_color.gamma_multiply(0.20));
-        painter.circle_filled(center, radius * 1.2_f32, glow_color.gamma_multiply(0.40));
-        // Glass
-        painter.circle_filled(center, radius, glow_color);
-        painter.circle_stroke(center, radius, Stroke::new(1.2_f32, Color32::WHITE.gamma_multiply(0.8)));
-    } else {
-        painter.circle_filled(center, radius, Color32::from_rgb(55, 56, 58));
-        painter.circle_stroke(center, radius, Stroke::new(1.0_f32, Color32::from_rgb(70, 72, 75)));
-    }
-
-    // Screw base
-    let base_rect = Rect::from_min_max(
-        Pos2::new(center.x - radius * 0.45_f32, center.y + radius * 0.7_f32),
-        Pos2::new(center.x + radius * 0.45_f32, center.y + radius * 1.2_f32),
-    );
-    painter.rect_filled(base_rect, CornerRadius::same(2), Color32::from_rgb(85, 87, 90));
-}
-
-// ---------------------------------------------------------------------------
-// Popover App Struct
+// Popover app
 // ---------------------------------------------------------------------------
 pub struct PopoverApp {
     opened_at: Instant,
     has_gained_focus: bool,
+    is_pinned: bool,
     state: State,
-    brightness_pct: u8,
-    is_online: bool,
-    custom_color: [u8; 3],
-    worker: AsyncBulbWorker,
+    /// Live slider value in 1..=255; committed into `state.brightness`.
+    brightness: f32,
+    /// Live slider value in 2200..=6500; committed into `state.kelvin`.
+    kelvin: f32,
+    link: Link,
+    latency_ms: u32,
+    rssi: Option<i32>,
+    custom_color: Color32,
+    show_picker: bool,
+    palette: Option<DroppedPalette>,
+    palette_error: Option<String>,
+    palette_rx: Option<Receiver<Result<DroppedPalette, String>>>,
+    extracting: bool,
+    requested_height: f32,
+    /// Screen position the popover was mapped at, and whether it hangs above
+    /// the cursor. When it does, growth must extend upward so the popover never
+    /// slides under the panel it was launched from.
+    origin: Pos2,
+    grows_upward: bool,
+    worker: BulbWorker,
     _pid_guard: Option<PidGuard>,
 }
 
 impl PopoverApp {
-    pub fn new(target_ip: Option<String>, pid_guard: Option<PidGuard>) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        target_ip: Option<String>,
+        pid_guard: Option<PidGuard>,
+        origin: Pos2,
+        grows_upward: bool,
+    ) -> Self {
+        theme::apply(&cc.egui_ctx);
+
         let mut state = load_state();
         if let Some(ip) = target_ip {
             state.ip = ip;
         }
 
-        let brightness_pct = ((state.brightness as f64 * 100.0 / 255.0).round() as u8).clamp(10, 100);
-        let custom_color = state.rgb;
-        let worker = AsyncBulbWorker::new(state.ip.clone());
+        let worker = BulbWorker::new(state.ip.clone(), cc.egui_ctx.clone());
+        let custom_color = Color32::from_rgb(state.rgb[0], state.rgb[1], state.rgb[2]);
 
         Self {
             opened_at: Instant::now(),
             has_gained_focus: false,
+            is_pinned: false,
+            brightness: state.brightness as f32,
+            kelvin: state.kelvin.clamp(2200, 6500) as f32,
             state,
-            brightness_pct,
-            is_online: true,
+            link: Link::Pinging,
+            latency_ms: 0,
+            rssi: None,
             custom_color,
+            show_picker: false,
+            palette: None,
+            palette_error: None,
+            palette_rx: None,
+            extracting: false,
+            requested_height: BASE_H,
+            origin,
+            grows_upward,
             worker,
             _pid_guard: pid_guard,
         }
     }
-}
 
-impl eframe::App for PopoverApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let elapsed = self.opened_at.elapsed().as_millis();
+    fn close(&mut self, ctx: &egui::Context) {
+        let _ = save_state(&self.state);
+        ctx.send_viewport_cmd(ViewportCommand::Close);
+    }
 
-        // 1. Explicitly request focus during initial frame window
-        if elapsed < 80 {
-            ctx.send_viewport_cmd(ViewportCommand::Focus);
-        }
-
-        // 2. Latch focus acquisition
-        let is_focused = ctx.input(|i| i.viewport().focused);
-        if is_focused == Some(true) {
-            self.has_gained_focus = true;
-        }
-
-        // 3. Auto-close when user clicks away / navigates away
-        if elapsed > 150 && self.has_gained_focus && is_focused == Some(false) {
-            let mouse_down = ctx.input(|i| i.pointer.primary_down());
-            if !mouse_down {
-                let _ = save_state(&self.state);
-                ctx.send_viewport_cmd(ViewportCommand::Close);
-                return;
+    fn glow(&self) -> Color32 {
+        match self.state.mode.as_str() {
+            "kelvin" => {
+                let (r, g, b) = kelvin_to_rgb(self.state.kelvin);
+                Color32::from_rgb(r, g, b)
             }
+            "scene" => Color32::from_rgb(255, 180, 50),
+            _ => Color32::from_rgb(self.state.rgb[0], self.state.rgb[1], self.state.rgb[2]),
         }
+    }
 
-        // 4. Escape key dismissal
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            let _ = save_state(&self.state);
-            ctx.send_viewport_cmd(ViewportCommand::Close);
-            return;
-        }
+    fn apply_rgb(&mut self, r: u8, g: u8, b: u8) {
+        self.state.rgb = [r, g, b];
+        self.state.hex = rgb_to_hex(r, g, b);
+        self.state.mode = "color".to_string();
+        self.state.power = true;
+        self.custom_color = Color32::from_rgb(r, g, b);
+        self.record_recent(rgb_to_hex(r, g, b));
+        self.worker.send(Cmd::Rgb(r, g, b));
+        let _ = save_state(&self.state);
+    }
 
-        // Check for worker events
+    fn record_recent(&mut self, hex: String) {
+        self.state.recent_colors.retain(|c| c != &hex);
+        self.state.recent_colors.insert(0, hex);
+        self.state.recent_colors.truncate(16);
+    }
+
+    fn drain_worker(&mut self) {
         while let Some(evt) = self.worker.try_recv() {
             match evt {
-                WorkerEvent::BulbOnline(pilot) => {
-                    self.is_online = true;
-                    if let Some(st) = pilot.state {
-                        self.state.power = st;
+                Event::Online { pilot, latency_ms } => {
+                    self.link = Link::Online;
+                    self.latency_ms = latency_ms;
+                    self.rssi = pilot.rssi;
+
+                    if let Some(on) = pilot.state {
+                        self.state.power = on;
                     }
-                    if let Some(dim) = pilot.dimming {
-                        self.brightness_pct = dim.clamp(10, 100);
-                        self.state.brightness = ((dim as f64 * 255.0 / 100.0).round() as u8).clamp(1, 255);
+                    if let Some(b255) = pilot.brightness_255() {
+                        self.state.brightness = b255.max(1);
+                        self.brightness = self.state.brightness as f32;
                     }
-                    if let Some(k) = pilot.temp {
+                    if let Some(k) = pilot.temp.filter(|k| *k > 0) {
                         self.state.kelvin = k;
+                        self.kelvin = k.clamp(2200, 6500) as f32;
                         self.state.mode = "kelvin".to_string();
                     } else if let Some((r, g, b)) = pilot.rgb() {
-                        self.state.rgb = [r, g, b];
-                        self.state.hex = rgb_to_hex(r, g, b);
+                        // Adopting the readback of our own pick would drift the
+                        // hex, since the RGB/white split is lossy in brightness.
+                        if !pilot.matches_rgb(self.state.rgb) {
+                            self.state.rgb = [r, g, b];
+                            self.state.hex = rgb_to_hex(r, g, b);
+                        }
                         self.state.mode = "color".to_string();
                     }
                     if let Some(sid) = pilot.scene_id {
@@ -363,300 +269,583 @@ impl eframe::App for PopoverApp {
                             self.state.mode = "scene".to_string();
                         }
                     }
+                    let _ = save_state(&self.state);
                 }
-                WorkerEvent::BulbOffline => {
-                    self.is_online = false;
+                Event::Offline(_) => {
+                    self.link = Link::Offline;
+                    self.rssi = None;
                 }
             }
         }
+    }
 
-        // Determine current glow color
-        let glow_color = if self.state.mode == "kelvin" {
-            let (r, g, b) = kelvin_to_rgb(self.state.kelvin);
-            Color32::from_rgb(r, g, b)
-        } else if self.state.mode == "scene" {
-            Color32::from_rgb(255, 180, 50)
-        } else {
-            Color32::from_rgb(self.state.rgb[0], self.state.rgb[1], self.state.rgb[2])
+    fn drain_palette(&mut self) {
+        let done = match self.palette_rx.as_ref() {
+            Some(rx) => match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(_) => None,
+            },
+            None => None,
         };
 
-        // Frameless panel styling
-        let frame = egui::Frame::new()
-            .fill(COLOR_BG)
-            .stroke(Stroke::new(1.0_f32, COLOR_BORDER))
-            .corner_radius(CornerRadius::same(10))
-            .inner_margin(egui::Margin::same(14));
-
-        egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
-            ui.spacing_mut().item_spacing = Vec2::new(8.0_f32, 10.0_f32);
-
-            // -------------------------------------------------------------
-            // 1. Header: Lightbulb icon + IP / Status + Power Pill Switch
-            // -------------------------------------------------------------
-            ui.horizontal(|ui| {
-                let (bulb_rect, _) = ui.allocate_exact_size(Vec2::new(32.0_f32, 32.0_f32), Sense::hover());
-                draw_lightbulb_icon(ui.painter(), bulb_rect.center(), 11.0_f32, self.state.power, glow_color);
-
-                ui.vertical(|ui| {
-                    ui.label(
-                        egui::RichText::new("WiZ SMART BULB")
-                            .color(COLOR_TEXT_PRIMARY)
-                            .strong()
-                            .size(13.5_f32),
-                    );
-
-                    let status_str = if !self.is_online {
-                        format!("{} (Offline)", self.state.ip)
-                    } else if self.state.power {
-                        format!("{} • ON", self.state.ip)
-                    } else {
-                        format!("{} • OFF", self.state.ip)
-                    };
-
-                    let status_color = if !self.is_online {
-                        Color32::from_rgb(230, 80, 80)
-                    } else {
-                        COLOR_TEXT_MUTED
-                    };
-
-                    ui.label(egui::RichText::new(status_str).color(status_color).size(10.5_f32));
-                });
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if draw_pill_toggle(ui, &mut self.state.power) {
-                        self.worker.send(WorkerCmd::SetPower(self.state.power));
-                        let _ = save_state(&self.state);
-                    }
-                });
-            });
-
-            ui.add(egui::Separator::default().spacing(4.0_f32));
-
-            // -------------------------------------------------------------
-            // 2. Brightness Slider
-            // -------------------------------------------------------------
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("🔆").size(14.0_f32));
-                ui.label(egui::RichText::new("Brightness").color(COLOR_TEXT_PRIMARY).size(12.0_f32));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        egui::RichText::new(format!("{}%", self.brightness_pct))
-                            .color(COLOR_TEXT_MUTED)
-                            .size(11.5_f32),
-                    );
-                });
-            });
-
-            let b_slider = egui::Slider::new(&mut self.brightness_pct, 10..=100)
-                .show_value(false)
-                .trailing_fill(true);
-            let b_resp = ui.add(b_slider);
-            if b_resp.changed() {
-                let val_255 = ((self.brightness_pct as f64 * 255.0 / 100.0).round() as u8).clamp(1, 255);
-                self.state.brightness = val_255;
-                if !self.state.power {
-                    self.state.power = true;
+        if let Some(result) = done {
+            self.palette_rx = None;
+            self.extracting = false;
+            match result {
+                Ok(p) => {
+                    self.palette_error = None;
+                    self.palette = Some(p);
                 }
-                self.worker.send(WorkerCmd::SetBrightness(val_255));
-                let _ = save_state(&self.state);
+                Err(e) => {
+                    self.palette = None;
+                    self.palette_error = Some(e);
+                }
             }
+        }
+    }
 
-            // -------------------------------------------------------------
-            // 3. Color Temperature (Kelvin) Slider
-            // -------------------------------------------------------------
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("🌡").size(14.0_f32));
-                ui.label(egui::RichText::new("Color Temp").color(COLOR_TEXT_PRIMARY).size(12.0_f32));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        egui::RichText::new(format!("{}K", self.state.kelvin))
-                            .color(COLOR_TEXT_MUTED)
-                            .size(11.5_f32),
-                    );
-                });
-            });
+    fn start_extraction(&mut self, ctx: &egui::Context, path: PathBuf) {
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        self.palette_rx = Some(rx);
+        self.extracting = true;
+        self.palette_error = None;
 
-            let k_slider = egui::Slider::new(&mut self.state.kelvin, 2700..=6500)
-                .show_value(false)
-                .trailing_fill(true);
-            let k_resp = ui.add(k_slider);
-            if k_resp.changed() {
-                self.state.mode = "kelvin".to_string();
-                if !self.state.power {
-                    self.state.power = true;
-                }
-                self.worker.send(WorkerCmd::SetKelvin(self.state.kelvin));
-                let _ = save_state(&self.state);
-            }
-
-            ui.add(egui::Separator::default().spacing(4.0_f32));
-
-            // -------------------------------------------------------------
-            // 4. Preset Scenes (Pill Buttons)
-            // -------------------------------------------------------------
-            ui.label(
-                egui::RichText::new("PRESET SCENES")
-                    .color(COLOR_TEXT_MUTED)
-                    .size(10.0_f32)
-                    .strong(),
-            );
-
-            egui::Grid::new("scenes_grid")
-                .spacing(Vec2::new(6.0_f32, 6.0_f32))
-                .show(ui, |ui| {
-                    for (i, &(sid, sname)) in QUICK_SCENES.iter().enumerate() {
-                        let is_selected = self.state.mode == "scene" && self.state.scene_id == sid;
-                        let btn_fill = if is_selected { COLOR_ACCENT_BLUE } else { COLOR_TRACK_BG };
-                        let text_color = if is_selected { Color32::WHITE } else { COLOR_TEXT_PRIMARY };
-
-                        let btn = egui::Button::new(egui::RichText::new(sname).color(text_color).size(11.0_f32))
-                            .fill(btn_fill)
-                            .corner_radius(CornerRadius::same(6))
-                            .min_size(Vec2::new(94.0_f32, 24.0_f32));
-
-                        if ui.add(btn).clicked() {
-                            self.state.scene_id = sid;
-                            self.state.mode = "scene".to_string();
-                            self.state.power = true;
-                            self.worker.send(WorkerCmd::SetScene(sid));
-                            let _ = save_state(&self.state);
-                        }
-
-                        if (i + 1) % 3 == 0 {
-                            ui.end_row();
-                        }
-                    }
-                });
-
-            ui.add(egui::Separator::default().spacing(4.0_f32));
-
-            // -------------------------------------------------------------
-            // 5. Color Palette (Preset Swatches + Custom Picker)
-            // -------------------------------------------------------------
-            ui.label(
-                egui::RichText::new("COLOR PALETTE")
-                    .color(COLOR_TEXT_MUTED)
-                    .size(10.0_f32)
-                    .strong(),
-            );
-
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = Vec2::new(7.0_f32, 6.0_f32);
-
-                for hex in &self.state.recent_colors {
-                    if let Ok((r, g, b)) = parse_color(hex) {
-                        let color = Color32::from_rgb(r, g, b);
-                        let is_active = self.state.mode == "color" && self.state.rgb == [r, g, b];
-                        let (rect, resp) = ui.allocate_exact_size(Vec2::new(20.0_f32, 20.0_f32), Sense::click());
-
-                        if resp.clicked() {
-                            self.state.rgb = [r, g, b];
-                            self.state.hex = hex.clone();
-                            self.state.mode = "color".to_string();
-                            self.state.power = true;
-                            self.custom_color = [r, g, b];
-                            self.worker.send(WorkerCmd::SetRgb(r, g, b));
-                            let _ = save_state(&self.state);
-                        }
-
-                        if ui.is_rect_visible(rect) {
-                            let painter = ui.painter();
-                            painter.circle_filled(rect.center(), 9.0_f32, color);
-                            let stroke_color = if is_active {
-                                Color32::WHITE
-                            } else if resp.hovered() {
-                                Color32::from_rgb(180, 180, 180)
-                            } else {
-                                Color32::from_rgb(30, 31, 33)
-                            };
-                            let stroke_w = if is_active { 2.0_f32 } else { 1.0_f32 };
-                            painter.circle_stroke(rect.center(), 9.0_f32, Stroke::new(stroke_w, stroke_color));
-                        }
-                    }
-                }
-
-                // Custom Color Picker Button
-                let mut srgba = egui::Color32::from_rgb(
-                    self.custom_color[0],
-                    self.custom_color[1],
-                    self.custom_color[2],
-                );
-                if egui::color_picker::color_edit_button_srgba(
-                    ui,
-                    &mut srgba,
-                    egui::color_picker::Alpha::Opaque,
-                ).changed() {
-                    let r = srgba.r();
-                    let g = srgba.g();
-                    let b = srgba.b();
-                    self.custom_color = [r, g, b];
-                    self.state.rgb = [r, g, b];
-                    self.state.hex = rgb_to_hex(r, g, b);
-                    self.state.mode = "color".to_string();
-                    self.state.power = true;
-                    self.worker.send(WorkerCmd::SetRgb(r, g, b));
-                    let _ = save_state(&self.state);
-                }
-            });
-
-            ui.add(egui::Separator::default().spacing(4.0_f32));
-
-            // -------------------------------------------------------------
-            // 6. Action Row: Toggle Button & Esc Hint
-            // -------------------------------------------------------------
-            ui.horizontal(|ui| {
-                let toggle_text = if self.state.power { "⚡ Turn Off" } else { "⚡ Turn On" };
-                let btn = egui::Button::new(
-                    egui::RichText::new(toggle_text).color(COLOR_TEXT_PRIMARY).size(11.5_f32),
-                )
-                .fill(COLOR_TRACK_BG)
-                .corner_radius(CornerRadius::same(6))
-                .min_size(Vec2::new(100.0_f32, 24.0_f32));
-
-                if ui.add(btn).clicked() {
-                    self.state.power = !self.state.power;
-                    self.worker.send(WorkerCmd::SetPower(self.state.power));
-                    let _ = save_state(&self.state);
-                }
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(egui::RichText::new("Esc to close").color(COLOR_TEXT_MUTED).size(10.0_f32));
-                });
-            });
+        thread::spawn(move || {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.display().to_string());
+            let result = extract_palette(&path, 8).map(|colors| DroppedPalette { name, colors });
+            let _ = tx.send(result);
+            ctx.request_repaint();
         });
+    }
+
+    fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        if dropped.is_empty() {
+            return;
+        }
+        let picked = dropped
+            .iter()
+            .filter_map(|f| f.path.clone())
+            .find(|p| is_supported_image(p));
+
+        match picked {
+            Some(path) => self.start_extraction(ctx, path),
+            None => {
+                self.palette = None;
+                self.palette_error = Some("Not an image file".to_string());
+            }
+        }
+    }
+
+    /// Popover height depends on what is expanded; resize the X11 window to fit.
+    fn sync_height(&mut self, ctx: &egui::Context) {
+        let mut wanted = BASE_H;
+        if self.show_picker {
+            wanted += PICKER_H;
+        }
+        if self.palette.is_some() || self.palette_error.is_some() || self.extracting {
+            wanted += PALETTE_ROW_H;
+        }
+        if (wanted - self.requested_height).abs() > 0.5 {
+            if self.grows_upward {
+                let bottom = self.origin.y + self.requested_height;
+                ctx.send_viewport_cmd(ViewportCommand::OuterPosition(Pos2::new(
+                    self.origin.x,
+                    (bottom - wanted).max(26.0),
+                )));
+            }
+            self.requested_height = wanted;
+            ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(WIN_W, wanted)));
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
-// run_gui: Launcher configuring NativeOptions and EWMH properties
+// Painted header controls (no emoji fonts — no tofu boxes)
 // ---------------------------------------------------------------------------
-pub fn run_gui(target_ip: Option<String>) -> Result<(), eframe::Error> {
+fn pin_button(ui: &mut egui::Ui, pinned: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(46.0, 20.0), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let color = if pinned {
+            theme::ACCENT_BLUE
+        } else if response.hovered() {
+            theme::TEXT_SECONDARY
+        } else {
+            theme::TEXT_MUTED
+        };
+        if response.hovered() || pinned {
+            painter.rect_filled(rect, CornerRadius::same(4), theme::INPUT_BG);
+        }
+
+        // Push-pin: head, stem, point.
+        let head = Pos2::new(rect.left() + 10.0, rect.center().y - 3.0);
+        painter.circle_filled(head, 3.5_f32, color);
+        painter.line_segment(
+            [head, Pos2::new(head.x, head.y + 7.0)],
+            Stroke::new(1.6_f32, color),
+        );
+
+        painter.text(
+            Pos2::new(rect.left() + 18.0, rect.center().y),
+            Align2::LEFT_CENTER,
+            if pinned { "Pinned" } else { "Pin" },
+            FontId::proportional(9.5),
+            color,
+        );
+    }
+    response
+}
+
+/// Circular "+" swatch that expands the inline color picker.
+fn custom_color_dot(ui: &mut egui::Ui, current: Color32, open: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let c = rect.center();
+        painter.circle_filled(c, 10.0_f32, current);
+        painter.circle_stroke(
+            c,
+            10.0_f32,
+            Stroke::new(
+                if open { 2.0_f32 } else { 1.0_f32 },
+                if open {
+                    Color32::WHITE
+                } else {
+                    theme::TEXT_MUTED
+                },
+            ),
+        );
+        let arm = 4.0;
+        let ink = if current.r() as u32 + current.g() as u32 + current.b() as u32 > 380 {
+            Color32::from_black_alpha(180)
+        } else {
+            Color32::WHITE
+        };
+        let stroke = Stroke::new(1.8_f32, ink);
+        painter.line_segment([Pos2::new(c.x - arm, c.y), Pos2::new(c.x + arm, c.y)], stroke);
+        painter.line_segment([Pos2::new(c.x, c.y - arm), Pos2::new(c.x, c.y + arm)], stroke);
+    }
+    response.on_hover_text("Custom color")
+}
+
+impl eframe::App for PopoverApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
+    }
+
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let elapsed = self.opened_at.elapsed().as_millis();
+
+        // Grab focus during the initial X11 mapping window.
+        if elapsed < 80 {
+            ctx.send_viewport_cmd(ViewportCommand::Focus);
+        }
+
+        let is_focused = ctx.input(|i| i.viewport().focused);
+        if is_focused == Some(true) {
+            self.has_gained_focus = true;
+        }
+
+        // Click-away dismissal (skipped while pinned or mid-drag).
+        if !self.is_pinned && elapsed > 150 && self.has_gained_focus && is_focused == Some(false) {
+            let busy = ctx.input(|i| i.pointer.primary_down());
+            if !busy {
+                self.close(ctx);
+                return;
+            }
+        }
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.close(ctx);
+            return;
+        }
+
+        self.drain_worker();
+        self.drain_palette();
+        self.handle_dropped_files(ctx);
+
+        let hovering_files = ctx.input(|i| !i.raw.hovered_files.is_empty());
+        let glow = self.glow();
+
+        let frame = egui::Frame::new()
+            .fill(theme::BG_DARK)
+            .stroke(Stroke::new(1.0_f32, theme::CARD_BORDER))
+            .corner_radius(CornerRadius::same(10))
+            .inner_margin(egui::Margin::symmetric(12, 10));
+
+        egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(6.0, 7.0);
+
+            // ---------------------------------------------------------------
+            // Header: bulb, title, live status, pin & close
+            // ---------------------------------------------------------------
+            ui.horizontal(|ui| {
+                let (icon, _) = ui.allocate_exact_size(Vec2::new(20.0, 20.0), Sense::hover());
+                theme::bulb_icon(ui.painter(), icon.center(), 7.0, self.state.power, glow);
+
+                ui.label(
+                    egui::RichText::new("WiZ Light")
+                        .color(theme::TEXT_PRIMARY)
+                        .strong()
+                        .size(12.0),
+                );
+
+                let (dot_color, status) = match self.link {
+                    Link::Online => {
+                        let detail = match self.rssi {
+                            Some(r) => format!("{r} dBm"),
+                            None => format!("{}ms", self.latency_ms),
+                        };
+                        (
+                            theme::ACCENT_GREEN,
+                            format!("{} ({detail})", self.state.ip),
+                        )
+                    }
+                    Link::Pinging => (
+                        theme::ACCENT_AMBER,
+                        format!("Pinging {}...", self.state.ip),
+                    ),
+                    Link::Offline => (theme::ACCENT_RED, "Offline".to_string()),
+                };
+                theme::status_dot(ui, dot_color);
+                ui.label(
+                    egui::RichText::new(status)
+                        .color(dot_color)
+                        .size(8.5)
+                        .family(egui::FontFamily::Monospace),
+                );
+
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if theme::window_button(ui, theme::WinButton::Close).clicked() {
+                        self.close(ctx);
+                    }
+                    if pin_button(ui, self.is_pinned).clicked() {
+                        self.is_pinned = !self.is_pinned;
+                    }
+                });
+            });
+
+            // ---------------------------------------------------------------
+            // Power banner
+            // ---------------------------------------------------------------
+            if theme::power_banner(ui, self.state.power, self.link != Link::Offline).clicked() {
+                if self.link == Link::Offline {
+                    // Unreachable: retry the connection instead of blind-toggling.
+                    self.link = Link::Pinging;
+                    self.worker.send(Cmd::Ping);
+                } else {
+                    self.state.power = !self.state.power;
+                    self.worker.send(Cmd::Power(self.state.power));
+                    self.worker.send(Cmd::Ping);
+                    let _ = save_state(&self.state);
+                }
+            }
+
+            // ---------------------------------------------------------------
+            // Brightness: slider + quick chips
+            // ---------------------------------------------------------------
+            theme::card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Brightness")
+                            .color(theme::TEXT_PRIMARY)
+                            .strong()
+                            .size(10.5),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let pct = (self.brightness * 100.0 / 255.0).round() as i32;
+                        ui.label(
+                            egui::RichText::new(format!("{pct}%"))
+                                .color(theme::ACCENT_BLUE)
+                                .strong()
+                                .size(10.5)
+                                .family(egui::FontFamily::Monospace),
+                        );
+                    });
+                });
+
+                let out = theme::track_slider(ui, &mut self.brightness, 1.0, 255.0, theme::ACCENT_BLUE);
+                if out.changed {
+                    self.state.brightness = self.brightness.round().clamp(1.0, 255.0) as u8;
+                    self.state.power = true;
+                    self.worker.send(Cmd::Brightness(self.state.brightness));
+                }
+                if out.released {
+                    let _ = save_state(&self.state);
+                }
+
+                if let Some(val) = theme::chip_row(ui, QUICK_BRIGHTNESS, |v| self.state.brightness == v, 18.0)
+                {
+                    self.brightness = val as f32;
+                    self.state.brightness = val;
+                    self.state.power = true;
+                    self.worker.send(Cmd::Brightness(val));
+                    let _ = save_state(&self.state);
+                }
+            });
+
+            // ---------------------------------------------------------------
+            // White presets: Kelvin gradient slider + chips
+            // ---------------------------------------------------------------
+            theme::card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    theme::section(ui, "WHITE PRESETS");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(format!("{}K", self.kelvin.round() as u16))
+                                .color(theme::TEXT_SECONDARY)
+                                .size(10.0)
+                                .family(egui::FontFamily::Monospace),
+                        );
+                    });
+                });
+
+                let out = theme::gradient_slider(ui, &mut self.kelvin, 2200.0, 6500.0, |t| {
+                    let (r, g, b) = kelvin_to_rgb((2200.0 + t * 4300.0) as u16);
+                    Color32::from_rgb(r, g, b)
+                });
+                if out.changed {
+                    self.state.kelvin = self.kelvin.round() as u16;
+                    self.state.mode = "kelvin".to_string();
+                    self.state.power = true;
+                    self.worker.send(Cmd::Kelvin(self.state.kelvin));
+                }
+                if out.released {
+                    let _ = save_state(&self.state);
+                }
+
+                let active_k = if self.state.mode == "kelvin" {
+                    self.state.kelvin
+                } else {
+                    0
+                };
+                if let Some(k) = theme::chip_row(ui, QUICK_KELVIN, |v| v == active_k, 20.0) {
+                    self.kelvin = k as f32;
+                    self.state.kelvin = k;
+                    self.state.mode = "kelvin".to_string();
+                    self.state.power = true;
+                    self.worker.send(Cmd::Kelvin(k));
+                    let _ = save_state(&self.state);
+                }
+            });
+
+            // ---------------------------------------------------------------
+            // Quick scenes
+            // ---------------------------------------------------------------
+            theme::card(ui, |ui| {
+                theme::section(ui, "QUICK SCENES");
+                let active_scene = if self.state.mode == "scene" {
+                    self.state.scene_id
+                } else {
+                    0
+                };
+                if let Some(sid) = theme::chip_row(ui, QUICK_SCENES, |v| v == active_scene, 20.0) {
+                    self.state.scene_id = sid;
+                    self.state.mode = "scene".to_string();
+                    self.state.power = true;
+                    self.worker.send(Cmd::Scene(sid));
+                    let _ = save_state(&self.state);
+                }
+            });
+
+            // ---------------------------------------------------------------
+            // Quick colors — or the palette extracted from a dropped image
+            // ---------------------------------------------------------------
+            theme::card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if self.palette.is_some() {
+                        theme::section(ui, "IMAGE PALETTE");
+                    } else {
+                        theme::section(ui, "QUICK COLORS");
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if self.palette.is_some() && ui.small_button("Reset").clicked() {
+                            self.palette = None;
+                            self.palette_error = None;
+                        }
+                    });
+                });
+
+                if self.extracting {
+                    ui.label(
+                        egui::RichText::new("Extracting colors...")
+                            .color(theme::TEXT_MUTED)
+                            .size(9.0),
+                    );
+                } else if let Some(err) = &self.palette_error {
+                    ui.label(
+                        egui::RichText::new(err.clone())
+                            .color(theme::ACCENT_RED)
+                            .size(9.0),
+                    );
+                } else if let Some(p) = &self.palette {
+                    let shown = if p.name.chars().count() > 36 {
+                        let head: String = p.name.chars().take(33).collect();
+                        format!("{head}...")
+                    } else {
+                        p.name.clone()
+                    };
+                    ui.label(
+                        egui::RichText::new(shown)
+                            .color(theme::TEXT_MUTED)
+                            .size(9.0),
+                    )
+                    .on_hover_text(p.name.clone());
+                }
+
+                let entries: Vec<(Color32, bool, String)> = match &self.palette {
+                    Some(p) => p
+                        .colors
+                        .iter()
+                        .map(|c| {
+                            (
+                                Color32::from_rgb(c.r, c.g, c.b),
+                                self.state.rgb == [c.r, c.g, c.b],
+                                format!("{} - {:.1}%", c.hex().to_uppercase(), c.percentage),
+                            )
+                        })
+                        .collect(),
+                    None => self
+                        .state
+                        .recent_colors
+                        .iter()
+                        .take(8)
+                        .filter_map(|hex| parse_color(hex).ok())
+                        .map(|(r, g, b)| {
+                            (
+                                Color32::from_rgb(r, g, b),
+                                self.state.rgb == [r, g, b],
+                                rgb_to_hex(r, g, b).to_uppercase(),
+                            )
+                        })
+                        .collect(),
+                };
+
+                let mut picked: Option<Color32> = None;
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    for (color, active, tip) in &entries {
+                        let is_color_mode = self.state.mode == "color";
+                        if theme::color_dot(ui, *color, 9.0, *active && is_color_mode)
+                            .on_hover_text(tip.clone())
+                            .clicked()
+                        {
+                            picked = Some(*color);
+                        }
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if custom_color_dot(ui, self.custom_color, self.show_picker).clicked() {
+                            self.show_picker = !self.show_picker;
+                        }
+                    });
+                });
+
+                if let Some(c) = picked {
+                    self.apply_rgb(c.r(), c.g(), c.b());
+                }
+
+                if self.show_picker {
+                    ui.add_space(4.0);
+                    let mut chosen = self.custom_color;
+                    if egui::color_picker::color_picker_color32(
+                        ui,
+                        &mut chosen,
+                        egui::color_picker::Alpha::Opaque,
+                    ) {
+                        self.apply_rgb(chosen.r(), chosen.g(), chosen.b());
+                    }
+                }
+            });
+
+            // ---------------------------------------------------------------
+            // Footer: open the full studio in a fresh process
+            // ---------------------------------------------------------------
+            if theme::wide_button(ui, "Open Full Studio...", 26.0).clicked() {
+                let _ = save_state(&self.state);
+                if let Ok(exe) = std::env::current_exe() {
+                    let _ = Command::new(exe)
+                        .arg("studio")
+                        .arg("--ip")
+                        .arg(&self.state.ip)
+                        .spawn();
+                }
+                self.close(ctx);
+            }
+        });
+
+        // Drop hint overlay.
+        if hovering_files {
+            let screen = ctx.screen_rect();
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("drop_hint"),
+            ));
+            painter.rect_filled(screen, CornerRadius::same(10), Color32::from_black_alpha(200));
+            painter.rect_stroke(
+                screen.shrink(3.0),
+                CornerRadius::same(10),
+                Stroke::new(2.0_f32, theme::ACCENT_BLUE),
+                egui::StrokeKind::Inside,
+            );
+            painter.text(
+                screen.center(),
+                Align2::CENTER_CENTER,
+                "Drop an image to extract its palette",
+                FontId::proportional(13.0),
+                theme::TEXT_PRIMARY,
+            );
+        }
+
+        self.sync_height(ctx);
+
+        // Keep the status line honest while the first ping is still in flight.
+        if self.link == Link::Pinging {
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Launcher
+// ---------------------------------------------------------------------------
+pub fn run_widget(target_ip: Option<String>) -> Result<(), eframe::Error> {
     let pid_guard = match check_single_instance() {
         Some(g) => g,
-        None => return Ok(()), // Toggled closed or debounced!
+        None => return Ok(()), // Toggled closed or debounced.
     };
 
     let (mx, my) = get_mouse_position();
-    let win_w = 340.0_f32;
-    let win_h = 445.0_f32;
-    let pos_x = (mx - win_w / 2.0_f32).clamp(10.0_f32, 1920.0_f32 - win_w - 10.0_f32);
-    let pos_y = if my < 60.0_f32 { 26.0_f32 } else { (my - win_h - 10.0_f32).max(26.0_f32) };
+    let pos_x = (mx - WIN_W / 2.0).clamp(10.0, 1920.0 - WIN_W - 10.0);
+    // Launched from a bottom panel the popover hangs above the cursor, so any
+    // later growth has to push its top edge up rather than its bottom edge down.
+    let grows_upward = my >= 60.0;
+    let pos_y = if grows_upward {
+        (my - BASE_H - 10.0).max(26.0)
+    } else {
+        26.0
+    };
+    let origin = Pos2::new(pos_x, pos_y);
 
     let native_options = eframe::NativeOptions {
         viewport: ViewportBuilder::default()
             .with_title("wizctl - Quick Control")
-            .with_inner_size(Vec2::new(win_w, win_h))
+            .with_inner_size(Vec2::new(WIN_W, BASE_H))
             .with_position(Pos2::new(pos_x, pos_y))
             .with_resizable(false)
-            .with_decorations(false)        // Frameless popup
-            .with_always_on_top()           // Floats above other windows
+            .with_decorations(false)
+            .with_always_on_top()
             .with_transparent(true)
-            .with_taskbar(false)            // Informs winit to omit from taskbar
-            .with_window_type(X11WindowType::Utility), // EWMH Utility type
+            .with_taskbar(false)
+            .with_window_type(X11WindowType::Utility),
         ..Default::default()
     };
 
-    // Active EWMH Property Injection
+    // EWMH property injection: no taskbar tab, no pager slot, stays above.
     thread::spawn(|| {
         thread::sleep(Duration::from_millis(40));
         let _ = Command::new("bash")
@@ -673,6 +862,14 @@ pub fn run_gui(target_ip: Option<String>) -> Result<(), eframe::Error> {
     eframe::run_native(
         "wizctl - Quick Control",
         native_options,
-        Box::new(move |_cc| Ok(Box::new(PopoverApp::new(target_ip, Some(pid_guard))))),
+        Box::new(move |cc| {
+            Ok(Box::new(PopoverApp::new(
+                cc,
+                target_ip,
+                Some(pid_guard),
+                origin,
+                grows_upward,
+            )))
+        }),
     )
 }

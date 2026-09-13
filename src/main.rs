@@ -1,4 +1,4 @@
-use wizctl::{bulb, genmon, state, ui};
+use wizctl::{bulb, genmon, state, studio, ui};
 
 use std::env;
 use std::fs;
@@ -22,7 +22,8 @@ OPTIONS:
     -i, --ip <IP>        IP address of the WiZ bulb (default: 192.168.0.102 or $WIZ_IP)
 
 SUBCOMMANDS:
-    gui, widget          Open the graphical popover widget (default)
+    widget               Open the compact panel popover (default)
+    gui, studio          Open the full WiZ Controller studio window
     on                   Turn the bulb on
     off                  Turn the bulb off
     toggle               Toggle bulb power state
@@ -68,8 +69,8 @@ fn handle_panel_click(target_ip: &str) -> Result<(), Box<dyn std::error::Error>>
                 if let Ok(cur) = content.trim().parse::<f64>() {
                     if (cur - now).abs() < 0.001 {
                         let _ = fs::remove_file(stamp_file);
-                        ui::run_gui(Some(target_ip.to_string()))
-                            .map_err(|e| format!("GUI error: {e}"))?;
+                        ui::run_widget(Some(target_ip.to_string()))
+                            .map_err(|e| format!("Widget error: {e}"))?;
                     }
                 }
             }
@@ -134,13 +135,15 @@ fn main() {
     let command = positional.first().map(|s| s.as_str()).unwrap_or("widget");
 
     let result: Result<(), Box<dyn std::error::Error>> = match command {
-        "gui" | "widget" => {
+        "widget" => {
             if click_mode {
                 handle_panel_click(&target_ip)
             } else {
-                ui::run_gui(Some(target_ip))
-                    .map_err(|e| format!("GUI error: {e}").into())
+                ui::run_widget(Some(target_ip)).map_err(|e| format!("Widget error: {e}").into())
             }
+        }
+        "gui" | "studio" => {
+            studio::run_studio(Some(target_ip)).map_err(|e| format!("Studio error: {e}").into())
         }
         "on" => bulb::command_on(&target_ip),
         "off" => bulb::command_off(&target_ip),

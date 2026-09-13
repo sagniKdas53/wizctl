@@ -1,5 +1,9 @@
 pub mod bulb;
 pub mod colors;
 pub mod genmon;
+pub mod palette;
 pub mod state;
+pub mod studio;
+pub mod theme;
 pub mod ui;
+pub mod worker;
