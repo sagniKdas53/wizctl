@@ -3,15 +3,14 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-BIN_PATH="$HOME/.local/bin/wizctl"
-LAUNCHER_DIR="$HOME/.config/xfce4/panel/launcher-21"
-DESKTOP_FILE="$LAUNCHER_DIR/17888794171.desktop"
+BIN_PATH="${WIZCTL_BIN_PATH:-$HOME/.local/bin/wizctl}"
+PANEL_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/xfce4/panel"
 
 echo "=== Installing wizctl Panel Widget & Desktop Launcher ==="
 
 # 0. Install binary if available
-mkdir -p "$HOME/.local/bin"
-if [ -f "$REPO_DIR/target/release/wizctl" ]; then
+mkdir -p "$(dirname "$BIN_PATH")"
+if [ ! -f "$BIN_PATH" ] && [ -f "$REPO_DIR/target/release/wizctl" ]; then
     cp "$REPO_DIR/target/release/wizctl" "$BIN_PATH"
     chmod +x "$BIN_PATH"
     echo "✓ Installed native binary to $BIN_PATH"
@@ -37,23 +36,20 @@ for panel_icon in panel_bulb_on.png panel_bulb_off.png panel_bulb_offline.png; d
 done
 echo "✓ Installed application and panel icons"
 
-# 2. Update panel launcher if present
-if [ -d "$LAUNCHER_DIR" ]; then
-    cat << PANEL_EOF > "$DESKTOP_FILE"
-[Desktop Entry]
-Version=1.0
-Type=Application
-Name=wizctl
-Comment=WiZ Smart Light Controller (Single-click: Quick Widget | Double-click: Toggle)
-Exec=$BIN_PATH widget --click
-Icon=$HOME/.local/share/icons/hicolor/48x48/apps/wizctl.png
-Path=$REPO_DIR
-Terminal=false
-StartupNotify=false
-PANEL_EOF
-    chmod +x "$DESKTOP_FILE"
-    echo "✓ Updated active XFCE panel launcher: $DESKTOP_FILE"
-fi
+# 2. Update existing wizctl panel launchers without assuming a machine-specific ID.
+for desktop_file in "$PANEL_DIR"/launcher-*/*.desktop; do
+    [ -f "$desktop_file" ] || continue
+    if grep -Eqi '^Exec=.*wizctl' "$desktop_file"; then
+        awk -v bin="$BIN_PATH" '
+            /^\[/ { in_entry = ($0 == "[Desktop Entry]") }
+            in_entry && /^Exec=/ { print "Exec=" bin " widget --click"; found = 1; next }
+            { print }
+            END { if (!found) exit 1 }
+        ' "$desktop_file" > "$desktop_file.wizctl-tmp"
+        mv "$desktop_file.wizctl-tmp" "$desktop_file"
+        echo "✓ Updated XFCE panel launcher: $desktop_file"
+    fi
+done
 
 # 3. Create desktop application launcher
 mkdir -p "$HOME/.local/share/applications"
@@ -66,7 +62,6 @@ GenericName=Smart Light Controller
 Comment=Control WiZ smart light bulbs over LAN
 Exec=$BIN_PATH gui
 Icon=wizctl
-Path=$REPO_DIR
 Terminal=false
 Categories=Utility;HardwareSettings;
 StartupNotify=true
@@ -84,7 +79,7 @@ APP_EOF
 echo "✓ Created application entry: $HOME/.local/share/applications/wizctl.desktop"
 
 # 4. Reload XFCE panel
-if command -v xfce4-panel >/dev/null 2>&1; then
+if [ "${WIZCTL_SKIP_PANEL_RELOAD:-0}" != "1" ] && command -v xfce4-panel >/dev/null 2>&1; then
     echo "Reloading xfce4-panel..."
     xfce4-panel -r || true
     echo "✓ XFCE panel reloaded!"

@@ -28,7 +28,7 @@ install: build
 	mkdir -p $(BINDIR)
 	cp target/release/wizctl $(BINDIR)/wizctl
 	chmod +x $(BINDIR)/wizctl
-	./scripts/setup_panel_widget.sh
+	WIZCTL_BIN_PATH="$(BINDIR)/wizctl" ./scripts/setup_panel_widget.sh
 
 panel:
 	./scripts/setup_panel_widget.sh

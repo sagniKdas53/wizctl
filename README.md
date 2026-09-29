@@ -6,16 +6,11 @@ A high-performance native Rust application and smart desktop popover widget for 
 
 ---
 
-## Performance Highlights
+## Runtime behavior
 
-| Metric | Previous Python `wizctl` | Native Rust `wizctl` |
-|---|---|---|
-| **Binary Size** | ~35 MB (PyInstaller) | **~4.7 MB (Stripped ELF)** |
-| **Cold Startup Time** | ~1400 ms | **< 4 ms** |
-| **Idle Memory (Closed)** | Leaked / resident | **Strictly 0 bytes (Clean process exit)** |
-| **Window Hygiene** | Taskbar tab, pager box | **Clean popup (0 taskbar/pager footprint)** |
-| **Click-Away Behavior** | Broken focus / manual hide | **Seamless auto-dismiss behind user** |
-| **Runtime Dependencies** | Python 3, Tkinter, pywizlight | **Zero external runtimes (pure self-contained ELF)** |
+The popover process exits when closed. The Rust build removes the Python and Tkinter runtime requirement. Startup time, open-window memory use, binary size, and XFCE window behavior need measurement on a desktop before comparing them with the targets in [the rewrite plan](WIZCTL_RUST_REWRITE_PLAN.md).
+
+The XFCE popover uses `xdotool` for cursor placement and `xdotool`/`xprop` for X11 window properties. Install those tools for the full panel behavior.
 
 ---
 
@@ -31,7 +26,7 @@ A high-performance native Rust application and smart desktop popover widget for 
 4. **Instant Single-Instance Toggling**:
    - PID guard and close-debounce latch so clicking the panel launcher toggles the popover open and closed instantly.
 5. **Pixel-Accurate XFCE Dark Theme**:
-   - Charcoal/slate dark palette (`#303133`) with custom vector-drawn pill toggles, sliders, glowing bulb icons, and color swatches.
+   - Dark palette with custom vector-drawn pill toggles, sliders, glowing bulb icons, and color swatches.
 
 ---
 
@@ -123,9 +118,14 @@ wizctl brightness 200
 
 # Set color (name, hex, or RGB)
 wizctl color blue
-wizctl color #ff5500
+wizctl color '#ff5500'
 wizctl color "255, 128, 0"
 wizctl color warmwhite
+
+# Extract an image palette; use --apply N to send a numbered color to the bulb
+wizctl palette photo.jpg --plain
+wizctl palette photo.jpg --colors 8 --apply 3
+wizctl palette photo.jpg --tui
 
 # Set color temperature in Kelvin (2200K - 6500K)
 wizctl kelvin 2700

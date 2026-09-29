@@ -1,9 +1,10 @@
-use wizctl::{bulb, genmon, state, studio, ui};
+use wizctl::{bulb, genmon, palette, state, studio, ui};
 
 use std::env;
 use std::fs;
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::Path;
-use std::process;
+use std::process::{self, Stdio};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -33,14 +34,243 @@ SUBCOMMANDS:
     kelvin <VALUE>       Set color temperature in Kelvin (1000K-10000K)
     scene <VALUE>        Set WiZ scene by ID or name
     scenes               List all available WiZ scenes
+    palette <IMAGE>      Extract dominant image colors (see `palette --help`)
     wizclick [MODE]      View or activate WiZclick wall switch modes
     genmon               Output XML status block for xfce4-genmon-plugin
 "#
     );
 }
 
+fn print_palette_help() {
+    println!(
+        r#"USAGE:
+    wizctl [--ip <IP>] palette <IMAGE> [--colors <N>] [--apply <N>] [--plain] [--tui]
+
+OPTIONS:
+    --colors <N>         Number of colors to extract, from 1 to 16 (default: 6)
+    --apply <N>          Set the numbered palette color on the bulb
+    --plain              Print the palette instead of opening the interactive picker
+    --tui                Open the interactive palette picker
+"#
+    );
+}
+
+fn format_palette(image: &str, colors: &[palette::PaletteColor]) -> String {
+    let mut lines = vec![format!("Palette from {image}:")];
+    for (index, color) in colors.iter().enumerate() {
+        let hex = color.hex();
+        lines.push(format!(
+            "  {}. {hex}  {:5.1}%  wizctl color '{hex}'",
+            index + 1,
+            color.percentage
+        ));
+    }
+    lines.join("\n")
+}
+
+fn supports_tui() -> bool {
+    io::stdin().is_terminal()
+        && io::stdout().is_terminal()
+        && env::var("TERM").map(|term| term != "dumb").unwrap_or(false)
+}
+
+#[cfg(unix)]
+struct TerminalMode(String);
+
+#[cfg(unix)]
+impl Drop for TerminalMode {
+    fn drop(&mut self) {
+        let _ = process::Command::new("stty").arg(&self.0).status();
+        let _ = io::stdout().write_all(b"\x1b[0m\x1b[?25h\n");
+    }
+}
+
+/// Pick a color using only ANSI and `stty`, keeping the binary dependency-free.
+/// This is intentionally unavailable on non-Unix systems until a cross-platform
+/// terminal backend is introduced.
+#[cfg(unix)]
+fn choose_palette_color(
+    image: &str,
+    colors: &[palette::PaletteColor],
+    ip: &str,
+) -> Result<Option<palette::PaletteColor>, String> {
+    if !supports_tui() {
+        return Err("palette picker needs an interactive ANSI terminal".to_string());
+    }
+    let saved_mode = process::Command::new("stty")
+        .arg("-g")
+        .stdin(Stdio::inherit())
+        .output()
+        .map_err(|e| format!("palette picker could not configure terminal: {e}"))?;
+    if !saved_mode.status.success() {
+        return Err("palette picker could not configure terminal".to_string());
+    }
+    let saved_mode = String::from_utf8_lossy(&saved_mode.stdout)
+        .trim()
+        .to_string();
+    let _mode = TerminalMode(saved_mode);
+    let raw_status = process::Command::new("stty")
+        .args(["raw", "-echo", "min", "1", "time", "0"])
+        .status();
+    if !raw_status.is_ok_and(|status| status.success()) {
+        return Err("palette picker could not configure terminal".to_string());
+    }
+
+    let mut stdout = io::stdout();
+    let mut stdin = io::stdin();
+    let mut selected = 0usize;
+    let result = loop {
+        let mut frame = format!("\x1b[2J\x1b[H\x1b[1mImage palette\x1b[0m  {image}\n");
+        frame.push_str(&format!(
+            "Use Up/Down then Enter to apply to {ip}; q or Esc cancels.\n\n"
+        ));
+        for (index, color) in colors.iter().enumerate() {
+            let marker = if index == selected { ">" } else { " " };
+            let hex = color.hex();
+            frame.push_str(&format!(
+                "{marker} {}. \x1b[48;2;{};{};{}m      \x1b[0m {hex}  {:5.1}%\n",
+                index + 1,
+                color.r,
+                color.g,
+                color.b,
+                color.percentage
+            ));
+        }
+        if stdout
+            .write_all(frame.as_bytes())
+            .and_then(|_| stdout.flush())
+            .is_err()
+        {
+            break Err("palette picker could not write to terminal".to_string());
+        }
+        let mut key = [0u8; 1];
+        if stdin.read_exact(&mut key).is_err() {
+            break Err("palette picker could not read from terminal".to_string());
+        }
+        match key[0] {
+            b'\r' | b'\n' => break Ok(Some(colors[selected])),
+            b'q' | 3 | 27 => {
+                // Arrow keys start with ESC. Treat a bare escape as cancel;
+                // briefly poll for a CSI tail so a lone Escape can dismiss.
+                if key[0] == 27 {
+                    let _ = process::Command::new("stty")
+                        .args(["min", "0", "time", "1"])
+                        .status();
+                    let mut tail = [0u8; 2];
+                    let has_tail = stdin.read_exact(&mut tail).is_ok();
+                    let _ = process::Command::new("stty")
+                        .args(["min", "1", "time", "0"])
+                        .status();
+                    if has_tail && tail == [b'[', b'A'] {
+                        selected = (selected + colors.len() - 1) % colors.len();
+                        continue;
+                    }
+                    if has_tail && tail == [b'[', b'B'] {
+                        selected = (selected + 1) % colors.len();
+                        continue;
+                    }
+                }
+                break Ok(None);
+            }
+            b'k' => selected = (selected + colors.len() - 1) % colors.len(),
+            b'j' => selected = (selected + 1) % colors.len(),
+            _ => {}
+        }
+    };
+    result
+}
+
+#[cfg(not(unix))]
+fn choose_palette_color(
+    _: &str,
+    _: &[palette::PaletteColor],
+    _: &str,
+) -> Result<Option<palette::PaletteColor>, String> {
+    Err("palette picker is not available on this platform".to_string())
+}
+
+fn run_palette(target_ip: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if args
+        .first()
+        .is_some_and(|arg| arg == "--help" || arg == "-h")
+    {
+        print_palette_help();
+        return Ok(());
+    }
+    let Some(image) = args.first() else {
+        return Err("palette command requires an image path".into());
+    };
+    let mut count = 6usize;
+    let mut apply = None;
+    let mut plain = false;
+    let mut tui = false;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--colors" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or("option '--colors' requires an argument")?;
+                count = value
+                    .parse()
+                    .map_err(|_| "--colors must be a number from 1 to 16")?;
+            }
+            "--apply" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or("option '--apply' requires an argument")?;
+                apply = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| "--apply must be a palette number")?,
+                );
+            }
+            "--plain" => plain = true,
+            "--tui" => tui = true,
+            "-h" | "--help" => {
+                print_palette_help();
+                return Ok(());
+            }
+            option if option.starts_with("--colors=") => {
+                count = option[9..]
+                    .parse()
+                    .map_err(|_| "--colors must be a number from 1 to 16")?;
+            }
+            option if option.starts_with("--apply=") => {
+                apply = Some(
+                    option[8..]
+                        .parse::<usize>()
+                        .map_err(|_| "--apply must be a palette number")?,
+                );
+            }
+            unknown => return Err(format!("unknown palette option '{unknown}'").into()),
+        }
+        index += 1;
+    }
+    if plain && tui {
+        return Err("--plain and --tui cannot be used together".into());
+    }
+    let colors = palette::extract_palette(Path::new(image), count)?;
+    if let Some(choice) = apply {
+        if !(1..=colors.len()).contains(&choice) {
+            return Err(format!("palette choice must be between 1 and {}", colors.len()).into());
+        }
+        println!("{}", format_palette(image, &colors));
+        bulb::command_color(target_ip, &colors[choice - 1].hex())?;
+    } else if tui || (!plain && supports_tui()) {
+        if let Some(color) = choose_palette_color(image, &colors, target_ip)? {
+            bulb::command_color(target_ip, &color.hex())?;
+        }
+    } else {
+        println!("{}", format_palette(image, &colors));
+    }
+    Ok(())
+}
+
 fn handle_panel_click(target_ip: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let stamp_file = Path::new("/tmp/wizctl_panel_click_stamp");
+    let stamp_file = ui::runtime_dir().join("panel_click_stamp");
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
@@ -48,7 +278,7 @@ fn handle_panel_click(target_ip: &str) -> Result<(), Box<dyn std::error::Error>>
 
     let mut is_double_click = false;
     if stamp_file.exists() {
-        if let Ok(content) = fs::read_to_string(stamp_file) {
+        if let Ok(content) = fs::read_to_string(&stamp_file) {
             if let Ok(prev) = content.trim().parse::<f64>() {
                 if now - prev <= 0.35 {
                     is_double_click = true;
@@ -58,17 +288,17 @@ fn handle_panel_click(target_ip: &str) -> Result<(), Box<dyn std::error::Error>>
     }
 
     if is_double_click {
-        let _ = fs::remove_file(stamp_file);
+        let _ = fs::remove_file(&stamp_file);
         bulb::command_toggle(target_ip)?;
         Ok(())
     } else {
-        let _ = fs::write(stamp_file, format!("{now}"));
+        let _ = fs::write(&stamp_file, format!("{now}"));
         thread::sleep(Duration::from_millis(350));
         if stamp_file.exists() {
-            if let Ok(content) = fs::read_to_string(stamp_file) {
+            if let Ok(content) = fs::read_to_string(&stamp_file) {
                 if let Ok(cur) = content.trim().parse::<f64>() {
                     if (cur - now).abs() < 0.001 {
-                        let _ = fs::remove_file(stamp_file);
+                        let _ = fs::remove_file(&stamp_file);
                         ui::run_widget(Some(target_ip.to_string()))
                             .map_err(|e| format!("Widget error: {e}"))?;
                     }
@@ -89,11 +319,11 @@ fn main() {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "-h" | "--help" => {
+            "-h" | "--help" if positional.is_empty() => {
                 print_help();
                 return;
             }
-            "-v" | "--version" => {
+            "-v" | "--version" if positional.is_empty() => {
                 println!("wizctl {VERSION}");
                 return;
             }
@@ -147,15 +377,15 @@ fn main() {
         }
         "on" => bulb::command_on(&target_ip),
         "off" => bulb::command_off(&target_ip),
-        "toggle" => {
-            bulb::command_toggle(&target_ip).map(|_| ())
-        }
+        "toggle" => bulb::command_toggle(&target_ip).map(|_| ()),
         "status" => bulb::command_status(&target_ip),
         "color" => {
             if positional.len() > 1 {
                 bulb::command_color(&target_ip, &positional[1]).map(|_| ())
             } else {
-                eprintln!("wizctl: color command requires a value (e.g. red, #ff5500, or 255,128,0)");
+                eprintln!(
+                    "wizctl: color command requires a value (e.g. red, #ff5500, or 255,128,0)"
+                );
                 process::exit(1);
             }
         }
@@ -202,6 +432,7 @@ fn main() {
             bulb::command_wizclick(&target_ip, mode)
         }
         "genmon" => genmon::run_genmon(Some(&target_ip)),
+        "palette" => run_palette(&target_ip, &positional[1..]),
         unknown => {
             eprintln!("wizctl: unknown command '{unknown}'. Run 'wizctl --help' for usage.");
             process::exit(1);

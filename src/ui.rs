@@ -4,7 +4,7 @@
 //! and file descriptors drop to zero. See `WIZCTL_RUST_REWRITE_PLAN.md`.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc::{channel, Receiver};
 use std::thread;
@@ -43,13 +43,34 @@ const PALETTE_ROW_H: f32 = 20.0;
 // ---------------------------------------------------------------------------
 // Single-instance PID guard & debounce latch
 // ---------------------------------------------------------------------------
-pub struct PidGuard;
+pub struct PidGuard {
+    pid_file: PathBuf,
+    stamp_file: PathBuf,
+    identity: String,
+}
 
 impl Drop for PidGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file("/tmp/wizctl_gui.pid");
-        let _ = fs::write("/tmp/wizctl_closed_stamp", format!("{}", now_millis()));
+        if fs::read_to_string(&self.pid_file).ok().as_deref() == Some(&self.identity) {
+            let _ = fs::remove_file(&self.pid_file);
+            let _ = fs::write(&self.stamp_file, format!("{}", now_millis()));
+        }
     }
+}
+
+pub fn runtime_dir() -> PathBuf {
+    let root = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir);
+    let dir = root.join("wizctl");
+    let _ = fs::create_dir_all(&dir);
+    dir
+}
+
+fn process_start_time(pid: u32) -> Option<String> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(") ")?.1.split_whitespace().nth(19).map(str::to_string)
 }
 
 fn now_millis() -> u128 {
@@ -60,34 +81,41 @@ fn now_millis() -> u128 {
 }
 
 pub fn check_single_instance() -> Option<PidGuard> {
-    let pid_file = Path::new("/tmp/wizctl_gui.pid");
+    let dir = runtime_dir();
+    let pid_file = dir.join("gui.pid");
+    let stamp_file = dir.join("closed_stamp");
     if pid_file.exists() {
-        if let Ok(content) = fs::read_to_string(pid_file) {
-            if let Ok(pid) = content.trim().parse::<i32>() {
-                if Path::new(&format!("/proc/{pid}")).exists() {
-                    let _ = Command::new("kill").arg(format!("{pid}")).status();
-                    let _ = fs::remove_file(pid_file);
-                    let _ = fs::write("/tmp/wizctl_closed_stamp", format!("{}", now_millis()));
-                    return None; // Toggled off.
+        if let Ok(content) = fs::read_to_string(&pid_file) {
+            if let Some((pid_text, start_time)) = content.trim().split_once(':') {
+                if let Ok(pid) = pid_text.parse::<u32>() {
+                    let same_start = process_start_time(pid).as_deref() == Some(start_time);
+                    let same_exe = fs::read_link(format!("/proc/{pid}/exe")).ok()
+                        == std::env::current_exe().ok();
+                    if same_start && same_exe {
+                        let _ = Command::new("kill").arg(pid_text).status();
+                        let _ = fs::remove_file(&pid_file);
+                        let _ = fs::write(&stamp_file, format!("{}", now_millis()));
+                        return None; // Toggled off.
+                    }
                 }
             }
         }
     }
 
-    let stamp_file = Path::new("/tmp/wizctl_closed_stamp");
     if stamp_file.exists() {
-        if let Ok(content) = fs::read_to_string(stamp_file) {
+        if let Ok(content) = fs::read_to_string(&stamp_file) {
             if let Ok(last_closed) = content.trim().parse::<u128>() {
                 if now_millis().saturating_sub(last_closed) < 250 {
-                    let _ = fs::remove_file(stamp_file);
+                    let _ = fs::remove_file(&stamp_file);
                     return None; // Debounce latch: stay closed.
                 }
             }
         }
     }
 
-    let _ = fs::write(pid_file, format!("{}", std::process::id()));
-    Some(PidGuard)
+    let identity = format!("{}:{}", std::process::id(), process_start_time(std::process::id()).unwrap_or_default());
+    let _ = fs::write(&pid_file, &identity);
+    Some(PidGuard { pid_file, stamp_file, identity })
 }
 
 // ---------------------------------------------------------------------------
@@ -114,6 +142,18 @@ pub fn get_mouse_position() -> (f32, f32) {
     (600.0_f32, 26.0_f32)
 }
 
+fn display_width() -> f32 {
+    Command::new("xdotool")
+        .arg("getdisplaygeometry")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .and_then(|out| out.split_whitespace().next()?.parse::<f32>().ok())
+        .filter(|width| *width > 0.0)
+        .unwrap_or(1920.0)
+}
+
 // ---------------------------------------------------------------------------
 // Dropped-image palette
 // ---------------------------------------------------------------------------
@@ -137,6 +177,7 @@ pub struct PopoverApp {
     has_gained_focus: bool,
     is_pinned: bool,
     state: State,
+    configured_ip: String,
     /// Live slider value in 1..=255; committed into `state.brightness`.
     brightness: f32,
     /// Live slider value in 2200..=6500; committed into `state.kelvin`.
@@ -171,6 +212,7 @@ impl PopoverApp {
         theme::apply(&cc.egui_ctx);
 
         let mut state = load_state();
+        let configured_ip = state.ip.clone();
         if let Some(ip) = target_ip {
             state.ip = ip;
         }
@@ -185,6 +227,7 @@ impl PopoverApp {
             brightness: state.brightness as f32,
             kelvin: state.kelvin.clamp(2200, 6500) as f32,
             state,
+            configured_ip,
             link: Link::Pinging,
             latency_ms: 0,
             rssi: None,
@@ -203,8 +246,14 @@ impl PopoverApp {
     }
 
     fn close(&mut self, ctx: &egui::Context) {
-        let _ = save_state(&self.state);
+        self.persist_state();
         ctx.send_viewport_cmd(ViewportCommand::Close);
+    }
+
+    fn persist_state(&self) {
+        let mut state = self.state.clone();
+        state.ip.clone_from(&self.configured_ip);
+        let _ = save_state(&state);
     }
 
     fn glow(&self) -> Color32 {
@@ -226,7 +275,7 @@ impl PopoverApp {
         self.custom_color = Color32::from_rgb(r, g, b);
         self.record_recent(rgb_to_hex(r, g, b));
         self.worker.send(Cmd::Rgb(r, g, b));
-        let _ = save_state(&self.state);
+        self.persist_state();
     }
 
     fn record_recent(&mut self, hex: String) {
@@ -269,7 +318,7 @@ impl PopoverApp {
                             self.state.mode = "scene".to_string();
                         }
                     }
-                    let _ = save_state(&self.state);
+                    self.persist_state();
                 }
                 Event::Offline(_) => {
                     self.link = Link::Offline;
@@ -542,7 +591,7 @@ impl eframe::App for PopoverApp {
                     self.state.power = !self.state.power;
                     self.worker.send(Cmd::Power(self.state.power));
                     self.worker.send(Cmd::Ping);
-                    let _ = save_state(&self.state);
+                    self.persist_state();
                 }
             }
 
@@ -576,7 +625,7 @@ impl eframe::App for PopoverApp {
                     self.worker.send(Cmd::Brightness(self.state.brightness));
                 }
                 if out.released {
-                    let _ = save_state(&self.state);
+                    self.persist_state();
                 }
 
                 if let Some(val) = theme::chip_row(ui, QUICK_BRIGHTNESS, |v| self.state.brightness == v, 18.0)
@@ -585,7 +634,7 @@ impl eframe::App for PopoverApp {
                     self.state.brightness = val;
                     self.state.power = true;
                     self.worker.send(Cmd::Brightness(val));
-                    let _ = save_state(&self.state);
+                    self.persist_state();
                 }
             });
 
@@ -616,7 +665,7 @@ impl eframe::App for PopoverApp {
                     self.worker.send(Cmd::Kelvin(self.state.kelvin));
                 }
                 if out.released {
-                    let _ = save_state(&self.state);
+                    self.persist_state();
                 }
 
                 let active_k = if self.state.mode == "kelvin" {
@@ -630,7 +679,7 @@ impl eframe::App for PopoverApp {
                     self.state.mode = "kelvin".to_string();
                     self.state.power = true;
                     self.worker.send(Cmd::Kelvin(k));
-                    let _ = save_state(&self.state);
+                    self.persist_state();
                 }
             });
 
@@ -649,7 +698,7 @@ impl eframe::App for PopoverApp {
                     self.state.mode = "scene".to_string();
                     self.state.power = true;
                     self.worker.send(Cmd::Scene(sid));
-                    let _ = save_state(&self.state);
+                    self.persist_state();
                 }
             });
 
@@ -766,7 +815,7 @@ impl eframe::App for PopoverApp {
             // Footer: open the full studio in a fresh process
             // ---------------------------------------------------------------
             if theme::wide_button(ui, "Open Full Studio...", 26.0).clicked() {
-                let _ = save_state(&self.state);
+                self.persist_state();
                 if let Ok(exe) = std::env::current_exe() {
                     let _ = Command::new(exe)
                         .arg("studio")
@@ -820,7 +869,7 @@ pub fn run_widget(target_ip: Option<String>) -> Result<(), eframe::Error> {
     };
 
     let (mx, my) = get_mouse_position();
-    let pos_x = (mx - WIN_W / 2.0).clamp(10.0, 1920.0 - WIN_W - 10.0);
+    let pos_x = (mx - WIN_W / 2.0).clamp(10.0, (display_width() - WIN_W - 10.0).max(10.0));
     // Launched from a bottom panel the popover hangs above the cursor, so any
     // later growth has to push its top edge up rather than its bottom edge down.
     let grows_upward = my >= 60.0;
@@ -850,11 +899,16 @@ pub fn run_widget(target_ip: Option<String>) -> Result<(), eframe::Error> {
         thread::sleep(Duration::from_millis(40));
         let _ = Command::new("bash")
             .arg("-c")
-            .arg("WIN_ID=$(xdotool search --name 'wizctl - Quick Control' 2>/dev/null | tail -1); \
+            .arg("for ((attempt=0; attempt<100; attempt++)); do \
+                      WIN_ID=$(xdotool search --name 'wizctl - Quick Control' 2>/dev/null | tail -1); \
+                      if [ -n \"$WIN_ID\" ]; then break; fi; sleep 0.05; \
+                  done; \
                   if [ -n \"$WIN_ID\" ]; then \
+                      sleep 0.5; \
                       xprop -id \"$WIN_ID\" -f _NET_WM_WINDOW_TYPE 32a -set _NET_WM_WINDOW_TYPE '_NET_WM_WINDOW_TYPE_UTILITY'; \
-                      xprop -id \"$WIN_ID\" -f _NET_WM_STATE 32a -set _NET_WM_STATE '_NET_WM_STATE_SKIP_TASKBAR, _NET_WM_STATE_SKIP_PAGER, _NET_WM_STATE_ABOVE'; \
                       xdotool windowactivate \"$WIN_ID\" 2>/dev/null || true; \
+                      xprop -id \"$WIN_ID\" -f _NET_WM_STATE 32a -set _NET_WM_STATE '_NET_WM_STATE_SKIP_TASKBAR, _NET_WM_STATE_SKIP_PAGER, _NET_WM_STATE_ABOVE'; \
+                      xdotool windowraise \"$WIN_ID\" 2>/dev/null || true; \
                   fi")
             .status();
     });
