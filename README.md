@@ -116,7 +116,7 @@ wizctl on
 wizctl off
 wizctl toggle
 
-# Set brightness (percentage or 0-255)
+# Set brightness (10%-100% or 25-255; 0 turns power OFF)
 wizctl brightness 80%
 wizctl brightness 200
 

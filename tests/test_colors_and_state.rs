@@ -79,6 +79,6 @@ fn test_state_defaults_and_sanitization() {
     state.brightness = 0;
     state.kelvin = 50000;
     let sanitized = sanitize_state(state);
-    assert_eq!(sanitized.brightness, 1);
+    assert_eq!(sanitized.brightness, 25);
     assert_eq!(sanitized.kelvin, 2700);
 }

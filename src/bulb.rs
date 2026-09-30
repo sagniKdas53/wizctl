@@ -429,29 +429,42 @@ pub fn apply_update_limited(
 
 pub fn get_favorites(ip: &str) -> Result<Vec<WiZclickFavorite>, Box<dyn std::error::Error>> {
     let payload = json!({ "method": "getFavs", "params": {} });
-    let resp = send_udp_json(ip, &payload, DEFAULT_TIMEOUT)?;
-    let mut favs = Vec::new();
-
-    if let Some(res) = resp.and_then(|r| r.get("result").cloned()) {
-        if let Some(favs_arr) = res.get("favs").and_then(|f| f.as_array()) {
-            for (idx, item) in favs_arr.iter().enumerate() {
-                let sid = if let Some(arr) = item.as_array() {
-                    arr.first().and_then(|v| v.as_u64()).unwrap_or(0) as u32
-                } else if let Some(num) = item.as_u64() {
-                    num as u32
-                } else {
-                    0
-                };
-                if sid != 0 {
-                    let name = get_scene_name(sid).unwrap_or("Unknown").to_string();
-                    favs.push(WiZclickFavorite {
-                        mode: (idx + 1) as u32,
-                        scene_id: sid,
-                        scene_name: name,
-                    });
-                }
-            }
+    let response = send_udp_json(ip, &payload, DEFAULT_TIMEOUT)?
+        .ok_or_else(|| "getFavs request timed out".to_string())?;
+    if let Some(error) = response.get("error") {
+        return Err(format!("Bulb error: {error}").into());
+    }
+    if let Some(method) = response.get("method") {
+        if method.as_str() != Some("getFavs") {
+            return Err("getFavs response has a mismatched method"
+                .to_string()
+                .into());
         }
+    }
+    let favorites = response
+        .get("result")
+        .and_then(|result| result.get("favs"))
+        .and_then(|favorites| favorites.as_array())
+        .ok_or_else(|| "getFavs response is missing an array 'result.favs'".to_string())?;
+
+    let mut favs = Vec::with_capacity(favorites.len());
+    for (idx, item) in favorites.iter().enumerate() {
+        let raw_id = if let Some(array) = item.as_array() {
+            array.first().and_then(|value| value.as_u64())
+        } else {
+            item.as_u64()
+        }
+        .ok_or_else(|| format!("getFavs entry {} has no numeric scene id", idx + 1))?;
+        let scene_id = u32::try_from(raw_id)
+            .map_err(|_| format!("getFavs entry {} scene id is out of range", idx + 1))?;
+        if scene_id == 0 {
+            return Err(format!("getFavs entry {} has invalid scene id 0", idx + 1).into());
+        }
+        favs.push(WiZclickFavorite {
+            mode: (idx + 1) as u32,
+            scene_id,
+            scene_name: get_scene_name(scene_id).unwrap_or("Unknown").to_string(),
+        });
     }
     Ok(favs)
 }
@@ -462,9 +475,28 @@ pub fn set_power(ip: &str, state: bool) -> Result<(), Box<dyn std::error::Error>
         .map_err(Into::into)
 }
 
+/// Convert the CLI's 0..255 brightness into a safe WiZ delta.
+///
+/// WiZ represents an ON dimming value only from 10 through 100 percent. Zero
+/// is therefore an explicit OFF command; values 1..24 cannot be represented
+/// faithfully and must not be silently promoted to the bulb's 10% minimum.
+pub fn brightness_pilot_params(brightness: u8) -> Result<serde_json::Value, BulbError> {
+    match brightness {
+        0 => Ok(json!({ "state": false })),
+        1..=24 => Err(BulbError::Message(
+            "brightness 1..24 is below the WiZ 10% minimum; use 0 to turn off or at least 25"
+                .to_string(),
+        )),
+        25..=255 => {
+            let dimming = (brightness as f64 * 100.0 / 255.0).round() as u8;
+            Ok(json!({ "state": true, "dimming": dimming }))
+        }
+    }
+}
+
 pub fn set_brightness(ip: &str, brightness: u8) -> Result<(), Box<dyn std::error::Error>> {
-    let dim = ((brightness as f64 * 100.0 / 255.0).round() as u8).clamp(10, 100);
-    apply_update(ip, None, json!({ "state": true, "dimming": dim }))
+    let params = brightness_pilot_params(brightness)?;
+    apply_update(ip, None, params)
         .map(|_| ())
         .map_err(Into::into)
 }
@@ -742,6 +774,10 @@ pub fn command_color(ip: &str, value: &str) -> Result<(u8, u8, u8), Box<dyn std:
 pub fn command_brightness(ip: &str, value: &str) -> Result<u8, Box<dyn std::error::Error>> {
     let b = parse_brightness(value)?;
     set_brightness(ip, b)?;
+    if b == 0 {
+        println!("✓ OFF (brightness 0)");
+        return Ok(b);
+    }
     let pct = (b as f64 * 100.0 / 255.0).round() as u8;
     println!("✓ Brightness {b}/255 ({pct}%)");
     Ok(b)
@@ -779,7 +815,7 @@ pub fn command_scenes() {
 }
 
 pub fn command_wizclick(ip: &str, mode: Option<u32>) -> Result<(), Box<dyn std::error::Error>> {
-    let mut favorites = get_favorites(ip).unwrap_or_default();
+    let mut favorites = get_favorites(ip)?;
     if favorites.is_empty() {
         favorites = vec![
             WiZclickFavorite {

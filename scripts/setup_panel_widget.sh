@@ -10,13 +10,18 @@ echo "=== Installing wizctl Panel Widget & Desktop Launcher ==="
 
 # 0. Install binary if available
 mkdir -p "$(dirname "$BIN_PATH")"
-if [ ! -f "$BIN_PATH" ] && [ -f "$REPO_DIR/target/release/wizctl" ]; then
+if [ -f "$BIN_PATH" ]; then
+    echo "✓ Using selected wizctl at $BIN_PATH"
+elif [ -f "$REPO_DIR/target/release/wizctl" ]; then
     cp "$REPO_DIR/target/release/wizctl" "$BIN_PATH"
     chmod +x "$BIN_PATH"
     echo "✓ Installed native binary to $BIN_PATH"
-elif command -v wizctl >/dev/null 2>&1; then
+elif [ -z "${WIZCTL_BIN_PATH:-}" ] && command -v wizctl >/dev/null 2>&1; then
     BIN_PATH="$(command -v wizctl)"
     echo "✓ Using existing wizctl at $BIN_PATH"
+else
+    echo "wizctl binary unavailable at $BIN_PATH; build release or set WIZCTL_BIN_PATH" >&2
+    exit 1
 fi
 
 # 1. Ensure user icons directory exists and copy icons

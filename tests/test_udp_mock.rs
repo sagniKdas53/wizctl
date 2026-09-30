@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use wizctl::bulb::{
-    apply_update, send_pilot, set_temperature, PacketRateLimiter, PilotResult, WIZ_PORT,
+    apply_update, command_brightness, command_wizclick, send_pilot, set_brightness,
+    set_temperature, PacketRateLimiter, PilotResult, WIZ_PORT,
 };
 
 fn pilot(state: bool, dimming: u8) -> Value {
@@ -164,6 +165,72 @@ fn cli_kelvin_1000_is_sent_exactly_and_read_back() {
     });
     set_temperature("127.0.0.1", 1000).unwrap();
     server.join().unwrap();
+}
+
+#[test]
+fn brightness_zero_writes_an_explicit_off_delta_and_reads_back() {
+    let _serial = protocol_lock();
+    let server = mock_server(3, move |index, request| match index {
+        0 => json!({"result": pilot(true, 50)}),
+        1 => {
+            assert_eq!(
+                request,
+                json!({"method":"setPilot","params":{"state":false}})
+            );
+            json!({"result":{"success":true}})
+        }
+        2 => json!({"result": pilot(false, 50)}),
+        _ => unreachable!(),
+    });
+    set_brightness("127.0.0.1", 0).unwrap();
+    server.join().unwrap();
+}
+
+#[test]
+fn below_minimum_cli_brightness_fails_before_network_io() {
+    let error = command_brightness("127.0.0.1", "1").unwrap_err();
+    assert!(error.to_string().contains("below the WiZ 10% minimum"));
+}
+
+#[test]
+fn wizclick_error_response_propagates_without_mutation() {
+    let _serial = protocol_lock();
+    let server = mock_server(1, move |_, request| {
+        assert_eq!(request["method"], "getFavs");
+        json!({"error":{"code":-1}})
+    });
+    assert!(command_wizclick("127.0.0.1", Some(1)).is_err());
+    assert_eq!(server.join().unwrap().len(), 1);
+}
+
+#[test]
+fn wizclick_malformed_favorites_propagate_without_mutation() {
+    let _serial = protocol_lock();
+    let server = mock_server(1, move |_, request| {
+        assert_eq!(request["method"], "getFavs");
+        json!({"result":{"favs":{"not":"an array"}}})
+    });
+    assert!(command_wizclick("127.0.0.1", Some(1)).is_err());
+    assert_eq!(server.join().unwrap().len(), 1);
+}
+
+#[test]
+fn wizclick_timeout_propagates_without_mutation() {
+    let _serial = protocol_lock();
+    let server = UdpSocket::bind(("127.0.0.1", WIZ_PORT)).unwrap();
+    let server_thread = thread::spawn(move || {
+        let mut bytes = [0; 2048];
+        let _ = server.recv_from(&mut bytes).unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        assert!(
+            server.recv_from(&mut bytes).is_err(),
+            "failed getFavs must not send setPilot"
+        );
+    });
+    assert!(command_wizclick("127.0.0.1", Some(1)).is_err());
+    server_thread.join().unwrap();
 }
 
 #[test]

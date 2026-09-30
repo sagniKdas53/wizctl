@@ -260,7 +260,7 @@ impl StudioApp {
         Self {
             ip_input: state.ip.clone(),
             hex_input: state.hex.clone(),
-            brightness: state.brightness.max(1) as f32,
+            brightness: state.brightness.max(25) as f32,
             kelvin: state.kelvin as f32,
             rgb: state.rgb,
             status: Status::Connecting,
@@ -346,7 +346,7 @@ impl StudioApp {
     }
 
     fn set_brightness(&mut self, value: u8) {
-        let value = value.max(1);
+        let value = value.max(25);
         self.brightness = value as f32;
         self.state.brightness = value;
         self.state.power = true;
@@ -715,7 +715,7 @@ impl StudioApp {
 
     fn brightness_card(&mut self, ui: &mut Ui) {
         theme::card(ui, |ui| {
-            let raw = self.brightness.round().clamp(1.0, 255.0) as u8;
+            let raw = self.brightness.round().clamp(25.0, 255.0) as u8;
             let pct = (raw as u32 * 100 + 127) / 255;
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Brightness").size(11.5).strong());
@@ -730,17 +730,17 @@ impl StudioApp {
             });
 
             let mut value = self.brightness;
-            let out = theme::track_slider(ui, &mut value, 1.0, 255.0, theme::ACCENT_BLUE);
+            let out = theme::track_slider(ui, &mut value, 25.0, 255.0, theme::ACCENT_BLUE);
             self.brightness = value;
             if out.changed {
                 self.bright_dragging = true;
-                let v = value.round().clamp(1.0, 255.0) as u8;
+                let v = value.round().clamp(25.0, 255.0) as u8;
                 self.state.brightness = v;
                 self.worker.send(Cmd::Brightness(v));
             }
             if out.released {
                 self.bright_dragging = false;
-                let v = self.brightness.round().clamp(1.0, 255.0) as u8;
+                let v = self.brightness.round().clamp(25.0, 255.0) as u8;
                 self.set_brightness(v);
             }
 
@@ -1276,8 +1276,7 @@ fn saved_preset_update(state: &State) -> Option<serde_json::Value> {
     state.power.then(|| {
         let mut update = serde_json::json!({
             "state": true,
-            "dimming": ((state.brightness.max(1) as f64 * 100.0 / 255.0).round() as u8)
-                .clamp(10, 100),
+            "dimming": ((state.brightness.max(25) as f64 * 100.0 / 255.0).round() as u8),
         });
         let object = update.as_object_mut().expect("restore update is an object");
         match state.mode.as_str() {

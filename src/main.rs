@@ -35,7 +35,7 @@ SUBCOMMANDS:
     toggle               Toggle bulb power state
     status               Show bulb status
     color <VALUE>        Set RGB color (name, hex #ff5500, or R,G,B)
-    brightness <VALUE>   Set brightness (0-255 or 0%-100%)
+    brightness <VALUE>   Set brightness (0 = OFF; 25-255 or 10%-100%)
     kelvin <VALUE>       Set color temperature in Kelvin (1000K-10000K)
     scene <VALUE>        Set WiZ scene by ID or name
     scenes               List all available WiZ scenes

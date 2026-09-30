@@ -31,14 +31,20 @@ Reconnect preset restoration is an explicit opt-in. Restoring an OFF preset
 sends only power OFF. Restoring an ON preset sends its selected mode and
 brightness in one update; normal controls send only their requested fields.
 
-The nine review regressions have dedicated coverage: timeout/rejected mutation,
+The twelve review regressions have dedicated coverage: timeout/rejected mutation,
 OFF restoration, black RGB, temporary studio IP, exact accepted Kelvin, obsolete
 image extraction completions, queued controls after worker-owned writes, active
-studio preset power-on intent, and Genmon click targeting. Queued controls
+studio preset power-on intent, Genmon click targeting, brightness zero/minimum
+semantics, explicit installer binary selection, and failed WiZclick discovery. Queued controls
 advance through confirmed worker-owned state changes; external changes still
 reject the mutation without retrying it. State/schema, path normalization,
 protocol conflicts, readback, terminal CLI, and monitor placement also have
 automated coverage.
+
+Brightness zero turns power OFF. Active brightness accepts 25–255 (10–100%);
+lower nonzero values are rejected before network I/O because the hardware
+minimum is 10%. State saves use a process-local sequence alongside timestamp
+and PID so simultaneous saves cannot share a temporary filename.
 
 Performance figures in `WIZCTL_RUST_REWRITE_PLAN.md` are targets, not measured
 guarantees. Single-monitor X11 smoke checks and monitor-geometry tests do not

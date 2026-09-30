@@ -4,7 +4,10 @@ use std::io::Write;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static SAVE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -130,7 +133,7 @@ pub fn sanitize_json_state(raw: &Value) -> State {
                     .and_then(|value| parse_brightness(value).ok())
             });
         if let Some(brightness) = parsed {
-            clean.brightness = brightness.max(1);
+            clean.brightness = brightness.max(25);
         }
     }
     if let Some(rgb) = raw.get("rgb").and_then(Value::as_array) {
@@ -217,7 +220,9 @@ pub fn save_state_at(
     let clean = sanitize_state(state.clone());
     let json_bytes = serde_json::to_vec_pretty(&clean)?;
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let temp_path = path.with_extension(format!("{}.{}.tmp", std::process::id(), nonce));
+    let sequence = SAVE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temp_path =
+        path.with_extension(format!("{}.{}.{}.tmp", std::process::id(), nonce, sequence));
     let mut temp = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -270,14 +275,17 @@ mod tests {
         let directory = std::env::temp_dir().join(format!("wizctl-state-{}", std::process::id()));
         fs::create_dir_all(&directory).unwrap();
         let path = directory.join("state.json");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
         let writers: Vec<_> = (0..8)
             .map(|brightness| {
                 let path = path.clone();
+                let barrier = barrier.clone();
                 std::thread::spawn(move || {
                     let state = State {
                         brightness,
                         ..State::default()
                     };
+                    barrier.wait();
                     save_state_at(&path, &state).unwrap();
                 })
             })

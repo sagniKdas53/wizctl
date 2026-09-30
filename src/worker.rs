@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 
 use crate::bulb::{
-    apply_update_limited, get_pilot_limited, BulbError, PacketRateLimiter, PilotResult,
+    apply_update_limited, brightness_pilot_params, get_pilot_limited, BulbError, PacketRateLimiter,
+    PilotResult,
 };
 
 /// Idle re-poll cadence while the bulb answers.
@@ -381,10 +382,16 @@ fn apply_and_report(
     use serde_json::json;
     let params = match &queued.cmd {
         Cmd::Power(on) => json!({ "state": on }),
-        Cmd::Brightness(b) => {
-            let dim = ((*b as f64 * 100.0 / 255.0).round() as u8).clamp(10, 100);
-            json!({ "state": true, "dimming": dim })
-        }
+        Cmd::Brightness(b) => match brightness_pilot_params(*b) {
+            Ok(params) => params,
+            Err(error) => {
+                let _ = event_tx.send(QueuedEvent {
+                    generation,
+                    event: Event::CommandFailed(error.to_string()),
+                });
+                return ApplyOutcome::Failed;
+            }
+        },
         Cmd::Kelvin(k) => json!({ "state": true, "temp": k }),
         Cmd::Rgb(r, g, b) => crate::bulb::rgb_pilot_params(*r, *g, *b),
         Cmd::Scene(sid) => json!({ "state": true, "sceneId": sid }),

@@ -238,7 +238,7 @@ pub struct PopoverApp {
     is_pinned: bool,
     state: State,
     configured_ip: String,
-    /// Live slider value in 1..=255; committed into `state.brightness`.
+    /// Live slider value in 25..=255; committed into `state.brightness`.
     brightness: f32,
     /// Live slider value in 2200..=6500; committed into `state.kelvin`.
     kelvin: f32,
@@ -364,7 +364,7 @@ impl PopoverApp {
             self.state.power = on;
         }
         if let Some(b255) = pilot.brightness_255() {
-            self.state.brightness = b255.max(1);
+            self.state.brightness = b255.max(25);
             self.brightness = self.state.brightness as f32;
         }
         if let Some(k) = pilot.temp.filter(|k| *k > 0) {
@@ -737,9 +737,9 @@ impl eframe::App for PopoverApp {
                 });
 
                 let out =
-                    theme::track_slider(ui, &mut self.brightness, 1.0, 255.0, theme::ACCENT_BLUE);
+                    theme::track_slider(ui, &mut self.brightness, 25.0, 255.0, theme::ACCENT_BLUE);
                 if out.changed {
-                    self.state.brightness = self.brightness.round().clamp(1.0, 255.0) as u8;
+                    self.state.brightness = self.brightness.round().clamp(25.0, 255.0) as u8;
                     self.state.power = true;
                     self.queue_command(Cmd::Brightness(self.state.brightness));
                 }

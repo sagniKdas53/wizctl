@@ -2,11 +2,13 @@
 
 The final review follow-up adds regression coverage for queued worker-owned
 writes, external changes during a queue, returning to an earlier state token,
-studio power-on intent, and Genmon click targeting.
+studio power-on intent, Genmon click targeting, zero/minimum brightness,
+explicit installer binary selection, failed WiZclick discovery, and simultaneous
+state saves.
 
 - `cargo fmt --check`: passed.
 - `cargo clippy --locked --all-targets -- -D warnings`: passed.
-- `cargo test --locked`: 71 passed, zero failures or ignored tests.
+- `cargo test --locked`: 77 passed, zero failures or ignored tests.
 - `cargo build --release --locked`: passed.
 - `bash -n scripts/setup_panel_widget.sh`: passed.
 - Interactive release palette picker in a PTY: `j` moved selection; `q`
