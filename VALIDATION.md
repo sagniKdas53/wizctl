@@ -3,19 +3,20 @@
 The final review follow-up adds regression coverage for queued worker-owned
 writes, external changes during a queue, returning to an earlier state token,
 studio power-on intent, Genmon click targeting, zero/minimum brightness,
-explicit installer binary selection, failed WiZclick discovery, and simultaneous
-state saves.
+explicit installer binary selection, failed WiZclick discovery, simultaneous
+state saves, and header hit testing with long connection text.
 
 - `cargo fmt --check`: passed.
 - `cargo clippy --locked --all-targets -- -D warnings`: passed.
-- `cargo test --locked`: 77 passed, zero failures or ignored tests.
+- `cargo test --locked`: 78 passed, zero failures or ignored tests.
 - `cargo build --release --locked`: passed.
 - `bash -n scripts/setup_panel_widget.sh`: passed.
 - Interactive release palette picker in a PTY: `j` moved selection; `q`
   cancelled with exit code zero and restored terminal mode.
 - Release X11 smoke: temporary studio IP stayed temporary after normal close;
   utility/skip-taskbar/skip-pager/above properties were observed; Escape,
-  second-launch toggle and focus loss each closed the popover.
+  second-launch toggle and focus loss each closed the popover; pin retained it
+  on focus loss and unpin restored dismissal.
 - Initial [three-OS CI](https://github.com/sagniKdas53/wizctl/actions/runs/36673966277)
   passed check, formatting, strict lint, tests, release build, CLI smoke and
   binary artifact upload on Linux, macOS and Windows. The
@@ -38,5 +39,9 @@ python3 scripts/verify_x11.py --binary target/release/wizctl
 ```
 
 The script writes structured evidence to `/tmp/wizctl-x11-validation.json`.
-Run it on an X11 desktop with `xdotool`, `xprop`, and `xrandr` available, after
+Run it on an X11 desktop with `xdotool`, `xprop`, and `xdpyinfo` available, after
 the socket test suite finishes (both use the local WiZ UDP port).
+
+For 0.2.1, popover placement reads Xinerama screen rectangles directly; no
+`xrandr` process is used by the launcher or smoke test. Hardware flash absence
+still requires user observation on the disabled laptop panel.

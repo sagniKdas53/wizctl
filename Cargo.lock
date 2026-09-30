@@ -3066,7 +3066,7 @@ dependencies = [
 
 [[package]]
 name = "wizctl"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "crossterm",
  "eframe",
@@ -3074,6 +3074,7 @@ dependencies = [
  "image",
  "serde",
  "serde_json",
+ "x11rb",
 ]
 
 [[package]]

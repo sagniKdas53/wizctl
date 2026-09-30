@@ -114,6 +114,28 @@ def main():
                 return output if all(value in output for value in expected) else None
 
             evidence["widget_properties"] = wait_for(properties, "popover EWMH properties")
+            # Exercise the actual pin hit target, then focus a different window.
+            subprocess.run(["xdotool", "mousemove", "--window", wid, "270", "20", "click", "1"], check=True)
+            time.sleep(0.2)
+            studio = launch("studio")
+            sid = wait_for(lambda: windows("WiZ Controller - wizctl", studio.pid), "studio for pin test")[-1]
+            subprocess.run(["xdotool", "windowactivate", "--sync", sid], check=True)
+            time.sleep(0.8)
+            assert widget.poll() is None, "Pinned popover closed on focus loss"
+            evidence["pin_keeps_open_on_focus_loss"] = True
+            subprocess.run(["xdotool", "windowactivate", "--sync", wid], check=True)
+            subprocess.run(["xdotool", "mousemove", "--window", wid, "270", "20", "click", "1"], check=True)
+            time.sleep(0.2)
+            subprocess.run(["xdotool", "windowactivate", "--sync", sid], check=True)
+            widget.wait(timeout=12)
+            assert widget.returncode == 0, widget.stderr.read().decode()
+            evidence["unpin_restores_focus_loss_dismissal"] = True
+            subprocess.run(["xdotool", "key", "alt+F4"], check=True)
+            studio.wait(timeout=12)
+            time.sleep(0.4)
+            widget = launch("widget")
+            wid = wait_for(lambda: windows("wizctl - Quick Control", widget.pid), "widget for Escape")[-1]
+
             subprocess.run(["xdotool", "windowactivate", "--sync", wid], check=True)
             subprocess.run(["xdotool", "key", "Escape"], check=True)
             widget.wait(timeout=12)
@@ -143,8 +165,10 @@ def main():
             evidence["focus_loss_exits"] = True
             subprocess.run(["xdotool", "key", "alt+F4"], check=True)
             studio.wait(timeout=12)
-            evidence["monitor_layout"] = subprocess.check_output(
-                ["xrandr", "--listmonitors"], text=True)
+            layout = subprocess.check_output(["xdpyinfo", "-ext", "XINERAMA"], text=True)
+            evidence["monitor_layout"] = "\n".join(
+                line for line in layout.splitlines() if line.startswith("XINERAMA") or "head #" in line
+            )
         finally:
             for child in children:
                 if child.poll() is None:

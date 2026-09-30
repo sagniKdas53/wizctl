@@ -14,20 +14,21 @@ use crate::colors::{hsv_to_rgb, rgb_to_hsv};
 // ---------------------------------------------------------------------------
 // Palette
 // ---------------------------------------------------------------------------
-pub const BG_DARK: Color32 = Color32::from_rgb(0x12, 0x12, 0x14);
-pub const CARD_BG: Color32 = Color32::from_rgb(0x1a, 0x1a, 0x1f);
-pub const CARD_BORDER: Color32 = Color32::from_rgb(0x2a, 0x2a, 0x32);
-pub const CARD_HOVER: Color32 = Color32::from_rgb(0x25, 0x25, 0x2e);
+// Charcoal background matched to the XFCE panel, with lighter control surfaces.
+pub const BG_DARK: Color32 = Color32::from_rgb(0x3b, 0x3e, 0x3f);
+pub const CARD_BG: Color32 = Color32::from_rgb(0x42, 0x47, 0x48);
+pub const CARD_BORDER: Color32 = Color32::from_rgb(0x60, 0x66, 0x67);
+pub const CARD_HOVER: Color32 = Color32::from_rgb(0x59, 0x61, 0x64);
 pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(0xf4, 0xf4, 0xf6);
-pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(0xa1, 0xa1, 0xaa);
-pub const TEXT_MUTED: Color32 = Color32::from_rgb(0x71, 0x71, 0x7a);
+pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(0xc4, 0xc9, 0xcb);
+pub const TEXT_MUTED: Color32 = Color32::from_rgb(0xaa, 0xb0, 0xb3);
 pub const ACCENT_BLUE: Color32 = Color32::from_rgb(0x3b, 0x82, 0xf6);
 pub const ACCENT_BLUE_DIM: Color32 = Color32::from_rgb(0x25, 0x63, 0xeb);
 pub const ACCENT_GREEN: Color32 = Color32::from_rgb(0x22, 0xc5, 0x5e);
 pub const ACCENT_GREEN_DIM: Color32 = Color32::from_rgb(0x16, 0xa3, 0x4a);
 pub const ACCENT_RED: Color32 = Color32::from_rgb(0xef, 0x44, 0x44);
 pub const ACCENT_AMBER: Color32 = Color32::from_rgb(0xf5, 0x9e, 0x0b);
-pub const INPUT_BG: Color32 = Color32::from_rgb(0x22, 0x22, 0x2a);
+pub const INPUT_BG: Color32 = Color32::from_rgb(0x4c, 0x52, 0x54);
 
 /// Install the shared dark visuals onto an `egui` context.
 pub fn apply(ctx: &egui::Context) {
@@ -60,7 +61,7 @@ pub fn apply(ctx: &egui::Context) {
 // Layout helpers
 // ---------------------------------------------------------------------------
 
-/// A rounded card panel matching the Python widget's `CARD_BG` surfaces.
+/// A rounded card panel with a lighter charcoal surface.
 pub fn card<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
     egui::Frame::new()
         .fill(CARD_BG)

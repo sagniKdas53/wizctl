@@ -170,48 +170,57 @@ pub fn get_mouse_position() -> (f32, f32) {
     (600.0_f32, 26.0_f32)
 }
 
-fn monitor_under_cursor(x: f32, y: f32) -> MonitorBounds {
-    let fallback = MonitorBounds {
+// Xinerama reports the X server's cached logical screen rectangles. Unlike
+// invoking xrandr, this does not request output discovery or driver reprobes.
+fn cached_monitors() -> Vec<MonitorBounds> {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xinerama::ConnectionExt;
+    let Ok((connection, screen_number)) = x11rb::connect(None) else {
+        return vec![];
+    };
+    if let Ok(cookie) = connection.xinerama_query_screens() {
+        if let Ok(reply) = cookie.reply() {
+            let monitors: Vec<_> = reply
+                .screen_info
+                .iter()
+                .filter_map(xinerama_bounds)
+                .collect();
+            if !monitors.is_empty() {
+                return monitors;
+            }
+        }
+    }
+    let screen = &connection.setup().roots[screen_number];
+    vec![MonitorBounds {
         x: 0.0,
         y: 0.0,
-        width: 1920.0,
-        height: 1080.0,
-    };
-    let output = Command::new("xrandr").arg("--listmonitors").output().ok();
-    output
-        .filter(|out| out.status.success())
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-        .and_then(|text| {
-            monitors_from_xrandr(&text)
-                .into_iter()
-                .find(|monitor| monitor.contains(x, y))
-        })
-        .unwrap_or(fallback)
+        width: screen.width_in_pixels as f32,
+        height: screen.height_in_pixels as f32,
+    }]
 }
 
-fn monitors_from_xrandr(text: &str) -> Vec<MonitorBounds> {
-    text.lines().filter_map(parse_xrandr_monitor).collect()
-}
-
-fn parse_xrandr_monitor(line: &str) -> Option<MonitorBounds> {
-    // `xrandr --listmonitors`: 0: +*DP-1 1920/509x1080/286+0+0 DP-1
-    let token = line
-        .split_whitespace()
-        .find(|word| word.contains('x') && (word.contains('+') || word[1..].contains('-')))?;
-    let (width, rest) = token.split_once('x')?;
-    let width = width.split('/').next()?.parse::<f32>().ok()?;
-    let offset = rest.find(['+', '-'])?;
-    let height = rest[..offset].split('/').next()?.parse::<f32>().ok()?;
-    let coordinates = &rest[offset..];
-    let second = coordinates[1..].find(['+', '-'])? + 1;
-    let x = coordinates[..second].parse::<f32>().ok()?;
-    let y = coordinates[second..].parse::<f32>().ok()?;
-    (width > 0.0 && height > 0.0).then_some(MonitorBounds {
-        x,
-        y,
-        width,
-        height,
+fn xinerama_bounds(screen: &x11rb::protocol::xinerama::ScreenInfo) -> Option<MonitorBounds> {
+    (screen.width > 0 && screen.height > 0).then_some(MonitorBounds {
+        x: screen.x_org as f32,
+        y: screen.y_org as f32,
+        width: screen.width as f32,
+        height: screen.height as f32,
     })
+}
+
+fn monitor_under_cursor(x: f32, y: f32) -> MonitorBounds {
+    let monitors = cached_monitors();
+    monitors
+        .iter()
+        .copied()
+        .find(|monitor| monitor.contains(x, y))
+        .or_else(|| monitors.first().copied())
+        .unwrap_or(MonitorBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 1920.0,
+            height: 1080.0,
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -235,6 +244,7 @@ enum Link {
 pub struct PopoverApp {
     opened_at: Instant,
     has_gained_focus: bool,
+    initial_focus_requested: bool,
     is_pinned: bool,
     state: State,
     configured_ip: String,
@@ -287,6 +297,7 @@ impl PopoverApp {
         Self {
             opened_at: Instant::now(),
             has_gained_focus: false,
+            initial_focus_requested: false,
             is_pinned: false,
             brightness: state.brightness as f32,
             kelvin: state.kelvin.clamp(2200, 6500) as f32,
@@ -505,7 +516,7 @@ impl PopoverApp {
 // Painted header controls (no emoji fonts — no tofu boxes)
 // ---------------------------------------------------------------------------
 fn pin_button(ui: &mut egui::Ui, pinned: bool) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(46.0, 20.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(58.0, 20.0), Sense::click());
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         let color = if pinned {
@@ -535,7 +546,55 @@ fn pin_button(ui: &mut egui::Ui, pinned: bool) -> egui::Response {
             color,
         );
     }
-    response
+    response.on_hover_text("Keep open when switching windows; click again to unpin")
+}
+
+fn popover_header(
+    ui: &mut egui::Ui,
+    power: bool,
+    glow: Color32,
+    dot_color: Color32,
+    status: &str,
+    pinned: bool,
+) -> (egui::Response, egui::Response) {
+    ui.horizontal(|ui| {
+        let details_width = (ui.available_width() - 96.0).max(0.0);
+        ui.allocate_ui_with_layout(
+            Vec2::new(details_width, 22.0),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                ui.set_width(details_width);
+                let (icon, _) = ui.allocate_exact_size(Vec2::new(20.0, 20.0), Sense::hover());
+                theme::bulb_icon(ui.painter(), icon.center(), 7.0, power, glow);
+
+                ui.label(
+                    egui::RichText::new("WiZ Light")
+                        .color(theme::TEXT_PRIMARY)
+                        .strong()
+                        .size(12.0),
+                );
+
+                theme::status_dot(ui, dot_color);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(status)
+                            .color(dot_color)
+                            .size(8.5)
+                            .family(egui::FontFamily::Monospace),
+                    )
+                    .truncate(),
+                );
+            },
+        );
+
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let close = theme::window_button(ui, theme::WinButton::Close);
+            let pin = pin_button(ui, pinned);
+            (close, pin)
+        })
+        .inner
+    })
+    .inner
 }
 
 /// Circular "+" swatch that expands the inline color picker.
@@ -594,8 +653,9 @@ impl eframe::App for PopoverApp {
         let elapsed = self.opened_at.elapsed().as_millis();
 
         // Grab focus during the initial X11 mapping window.
-        if elapsed < 80 {
+        if !self.initial_focus_requested {
             ctx.send_viewport_cmd(ViewportCommand::Focus);
+            self.initial_focus_requested = true;
         }
 
         let is_focused = ctx.input(|i| i.viewport().focused);
@@ -649,45 +709,31 @@ impl eframe::App for PopoverApp {
             // ---------------------------------------------------------------
             // Header: bulb, title, live status, pin & close
             // ---------------------------------------------------------------
-            ui.horizontal(|ui| {
-                let (icon, _) = ui.allocate_exact_size(Vec2::new(20.0, 20.0), Sense::hover());
-                theme::bulb_icon(ui.painter(), icon.center(), 7.0, self.state.power, glow);
-
-                ui.label(
-                    egui::RichText::new("WiZ Light")
-                        .color(theme::TEXT_PRIMARY)
-                        .strong()
-                        .size(12.0),
-                );
-
-                let (dot_color, status) = match self.link {
-                    Link::Online => {
-                        let detail = match self.rssi {
-                            Some(r) => format!("{r} dBm"),
-                            None => format!("{}ms", self.latency_ms),
-                        };
-                        (theme::ACCENT_GREEN, format!("{} ({detail})", self.state.ip))
-                    }
-                    Link::Pinging => (theme::ACCENT_AMBER, format!("Pinging {}...", self.state.ip)),
-                    Link::Offline => (theme::ACCENT_RED, "Offline".to_string()),
-                };
-                theme::status_dot(ui, dot_color);
-                ui.label(
-                    egui::RichText::new(status)
-                        .color(dot_color)
-                        .size(8.5)
-                        .family(egui::FontFamily::Monospace),
-                );
-
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if theme::window_button(ui, theme::WinButton::Close).clicked() {
-                        self.close(ctx);
-                    }
-                    if pin_button(ui, self.is_pinned).clicked() {
-                        self.is_pinned = !self.is_pinned;
-                    }
-                });
-            });
+            let (dot_color, status) = match self.link {
+                Link::Online => {
+                    let detail = match self.rssi {
+                        Some(r) => format!("{r} dBm"),
+                        None => format!("{}ms", self.latency_ms),
+                    };
+                    (theme::ACCENT_GREEN, format!("{} ({detail})", self.state.ip))
+                }
+                Link::Pinging => (theme::ACCENT_AMBER, format!("Pinging {}...", self.state.ip)),
+                Link::Offline => (theme::ACCENT_RED, "Offline".to_string()),
+            };
+            let (close, pin) = popover_header(
+                ui,
+                self.state.power,
+                glow,
+                dot_color,
+                &status,
+                self.is_pinned,
+            );
+            if close.clicked() {
+                self.close(ctx);
+            }
+            if pin.clicked() {
+                self.is_pinned = !self.is_pinned;
+            }
 
             if let Some(error) = &self.command_error {
                 ui.label(
@@ -1030,15 +1076,12 @@ pub fn run_widget(target_ip: Option<String>) -> Result<(), eframe::Error> {
         let _ = Command::new("bash")
             .arg("-c")
             .arg("for ((attempt=0; attempt<100; attempt++)); do \
-                      WIN_ID=$(xdotool search --all --pid \"$1\" --name 'wizctl - Quick Control' 2>/dev/null | tail -1); \
+                      WIN_ID=$(xdotool search --all --onlyvisible --pid \"$1\" --name 'wizctl - Quick Control' 2>/dev/null | tail -1); \
                       if [ -n \"$WIN_ID\" ]; then break; fi; sleep 0.05; \
                   done; \
                   if [ -n \"$WIN_ID\" ]; then \
-                      sleep 0.5; \
                       xprop -id \"$WIN_ID\" -f _NET_WM_WINDOW_TYPE 32a -set _NET_WM_WINDOW_TYPE '_NET_WM_WINDOW_TYPE_UTILITY'; \
-                      xdotool windowactivate \"$WIN_ID\" 2>/dev/null || true; \
                       xprop -id \"$WIN_ID\" -f _NET_WM_STATE 32a -set _NET_WM_STATE '_NET_WM_STATE_SKIP_TASKBAR, _NET_WM_STATE_SKIP_PAGER, _NET_WM_STATE_ABOVE'; \
-                      xdotool windowraise \"$WIN_ID\" 2>/dev/null || true; \
                   fi")
             .arg("wizctl-x11-window")
             .arg(process_id)
@@ -1073,15 +1116,97 @@ mod tests {
     use super::*;
 
     #[test]
-    fn xrandr_monitor_parser_handles_offsets_and_edges() {
-        let monitors = monitors_from_xrandr(
-            "Monitors: 3\n 0: +*HDMI-1 1920/509x1080/286+0+0 HDMI-1\n 1: +DP-1 1280/338x1024/270-1280+0 DP-1\n 2: +DP-2 1024/270x768/203+0-768 DP-2\n",
-        );
+    fn cached_screen_rectangles_handle_offsets_and_edges() {
+        use x11rb::protocol::xinerama::ScreenInfo;
+        let monitors: Vec<_> = [
+            ScreenInfo {
+                x_org: 0,
+                y_org: 0,
+                width: 1920,
+                height: 1080,
+            },
+            ScreenInfo {
+                x_org: -1280,
+                y_org: 0,
+                width: 1280,
+                height: 1024,
+            },
+            ScreenInfo {
+                x_org: 0,
+                y_org: -768,
+                width: 1024,
+                height: 768,
+            },
+        ]
+        .iter()
+        .filter_map(xinerama_bounds)
+        .collect();
         assert_eq!(monitors.len(), 3);
         assert!(monitors[0].contains(1919.0, 1079.0));
         assert!(monitors[1].contains(-1.0, 0.0));
         assert!(monitors[2].contains(0.0, -1.0));
         assert!(!monitors[1].contains(0.0, 100.0));
+    }
+
+    #[test]
+    fn pin_remains_clickable_with_long_connection_status() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut position = Pos2::ZERO;
+        let mut pinned = false;
+        for frame in 0..4 {
+            let events = match frame {
+                2 => vec![
+                    egui::Event::PointerMoved(position),
+                    egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                3 => vec![egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                _ => vec![],
+            };
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        Pos2::ZERO,
+                        Vec2::new(WIN_W, BASE_H),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let bounds = ui.max_rect();
+                        let (_, pin) = popover_header(
+                            ui,
+                            true,
+                            Color32::WHITE,
+                            theme::ACCENT_GREEN,
+                            "Pinging 192.168.100.123... (-100 dBm)",
+                            pinned,
+                        );
+                        assert!(
+                            bounds.contains_rect(pin.rect),
+                            "pin outside header: {:?}",
+                            pin.rect
+                        );
+                        position = pin.rect.center();
+                        if pin.clicked() {
+                            pinned = !pinned;
+                        }
+                    });
+                },
+            );
+        }
+        assert!(pinned, "the visible pin must accept its click");
     }
 
     #[test]
