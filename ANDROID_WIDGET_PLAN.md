@@ -36,10 +36,12 @@ The widget click path should be:
    instance.
 7. On timeout, show `unreachable` without guessing or flipping cached state.
 
-Use a short bounded retry policy (for example, two attempts within a few
-seconds). A toggle is a read-then-write operation and WiZ LAN control offers no
-atomic compare-and-set, so concurrent control from the WiZ app, a wall switch,
-or automation can still race. The UI must treat the final readback as truth.
+Retry only status reads, with a short bounded policy. Once a mutation has been
+sent, an acknowledgment timeout does not prove that it failed: read back the
+state instead of retrying the toggle. Refuse a stale expected state before
+writing, show the refreshed observation, and require another explicit tap.
+WiZ LAN control offers no atomic compare-and-set, so concurrent controllers
+can still race between the read and write. Treat final readback as truth.
 
 ## Modules and files
 
@@ -83,9 +85,10 @@ the same checked-in JSON fixtures.
 
 ### Milestone 0 — settle the core direction
 
-Choose whether `main` remains the Python CLI/library or is replaced by the Rust
-desktop application. This does not block a native Android client, but it decides
-which implementation supplies the canonical protocol fixtures and semantics.
+The direction is settled by PR #4: `main` becomes the Rust 0.2 CLI and desktop
+application. Use `src/bulb.rs` for the canonical delta/conflict/readback semantics
+and `tests/fixtures/wiz/` for sanitized protocol examples. Android uses a pure
+Kotlin client; it does not embed the desktop application.
 
 ### Milestone 1 — protocol spike
 
