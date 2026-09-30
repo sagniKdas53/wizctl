@@ -16,6 +16,7 @@ image = { version = "0.25", default-features = false, features = [
     "bmp",
     "tiff",
 ] }
+crossterm = "0.28"
 
 [profile.release]
 opt-level = 3

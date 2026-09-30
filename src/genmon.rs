@@ -2,8 +2,8 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-use crate::colors::get_scene_name;
 use crate::bulb::{get_pilot, PilotResult};
+use crate::colors::get_scene_name;
 use crate::state::load_state;
 use crate::state::State;
 
@@ -15,7 +15,11 @@ pub fn get_panel_asset_dir() -> PathBuf {
     let base_dir = if let Ok(data_home) = env::var("XDG_DATA_HOME") {
         PathBuf::from(data_home).join("wizctl").join("assets")
     } else if let Ok(home) = env::var("HOME") {
-        PathBuf::from(home).join(".local").join("share").join("wizctl").join("assets")
+        PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join("wizctl")
+            .join("assets")
     } else {
         PathBuf::from("/tmp/wizctl/assets")
     };
@@ -57,13 +61,24 @@ pub fn render_genmon_xml(ip: &str, state: &State, pilot: Option<&PilotResult>) -
     let power_str = if power { "ON" } else { "OFF" };
     let scene_id = pilot
         .map(|p| p.scene_id.unwrap_or(0))
-        .unwrap_or(if state.mode == "scene" { state.scene_id } else { 0 });
+        .unwrap_or(if state.mode == "scene" {
+            state.scene_id
+        } else {
+            0
+        });
     let kelvin = pilot
         .map(|p| p.temp.unwrap_or(0))
-        .unwrap_or(if state.mode == "kelvin" { state.kelvin } else { 0 });
+        .unwrap_or(if state.mode == "kelvin" {
+            state.kelvin
+        } else {
+            0
+        });
 
     let (icon_path, status_text) = if pilot.is_none() {
-        (assets_dir.join("panel_bulb_offline.png"), "OFFLINE".to_string())
+        (
+            assets_dir.join("panel_bulb_offline.png"),
+            "OFFLINE".to_string(),
+        )
     } else if power {
         let text = if scene_id > 0 {
             let sname = get_scene_name(scene_id).unwrap_or("Scene");

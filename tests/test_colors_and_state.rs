@@ -71,7 +71,7 @@ fn test_kelvin_to_rgb_curve() {
 #[test]
 fn test_state_defaults_and_sanitization() {
     let mut state = State::default();
-    assert_eq!(state.power, true);
+    assert!(state.power);
     assert_eq!(state.brightness, 255);
     assert_eq!(state.kelvin, 2700);
     assert_eq!(state.scene_id, 6);

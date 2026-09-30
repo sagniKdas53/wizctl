@@ -1,7 +1,8 @@
-use std::net::UdpSocket;
-use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::fmt;
+use std::net::{IpAddr, UdpSocket};
+use std::time::{Duration, Instant};
 
 use crate::colors::{
     get_scene_name, hsv_to_rgb, parse_brightness, parse_color, parse_kelvin, parse_scene,
@@ -12,7 +13,77 @@ use crate::state::{validate_ip, State};
 pub const WIZ_PORT: u16 = 38899;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(600);
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// WiZ bulbs become unreliable when a UI sends a burst of UDP commands.  This
+/// is deliberately shared by every worker packet, including polls.
+pub const MAX_PACKETS_PER_SECOND: u32 = 12;
+
+#[derive(Debug)]
+pub enum BulbError {
+    Io(std::io::Error),
+    Json(serde_json::Error),
+    Message(String),
+    StateConflict {
+        expected: String,
+        current: Box<PilotResult>,
+    },
+}
+
+impl fmt::Display for BulbError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "{e}"),
+            Self::Json(e) => write!(f, "{e}"),
+            Self::Message(message) => f.write_str(message),
+            Self::StateConflict { expected, current } => write!(
+                f,
+                "bulb state changed since it was last read (expected {expected}, current {}); refresh before applying the change",
+                current.state_token()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BulbError {}
+impl From<std::io::Error> for BulbError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+impl From<serde_json::Error> for BulbError {
+    fn from(value: serde_json::Error) -> Self {
+        Self::Json(value)
+    }
+}
+
+/// Spacing limiter for the single worker's UDP traffic.  The first packet is
+/// immediate; all following packets are at least 1/12 second apart.
+pub struct PacketRateLimiter {
+    next_packet: Instant,
+}
+
+impl PacketRateLimiter {
+    pub fn new() -> Self {
+        Self {
+            next_packet: Instant::now(),
+        }
+    }
+    pub fn wait(&mut self) {
+        let now = Instant::now();
+        if self.next_packet > now {
+            std::thread::sleep(self.next_packet - now);
+        }
+        self.next_packet =
+            Instant::now() + Duration::from_secs_f64(1.0 / MAX_PACKETS_PER_SECOND as f64);
+    }
+}
+
+impl Default for PacketRateLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct PilotResult {
     pub mac: Option<String>,
     pub rssi: Option<i32>,
@@ -28,7 +99,13 @@ pub struct PilotResult {
     pub w: Option<u8>,
     /// Cold-white channel.
     pub c: Option<u8>,
-    pub src: Option<String>,
+    /// WiZ firmware sends this as either a string or a number.
+    pub src: Option<serde_json::Value>,
+    #[serde(rename = "speed")]
+    pub speed: Option<u8>,
+    #[serde(rename = "schdPsetId")]
+    pub rhythm_id: Option<u32>,
+    pub ratio: Option<u8>,
 }
 
 impl PilotResult {
@@ -37,9 +114,8 @@ impl PilotResult {
     }
 
     pub fn brightness_255(&self) -> Option<u8> {
-        self.dimming.map(|d| {
-            ((d as f64 * 255.0 / 100.0).round().clamp(0.0, 255.0)) as u8
-        })
+        self.dimming
+            .map(|d| ((d as f64 * 255.0 / 100.0).round().clamp(0.0, 255.0)) as u8)
     }
 
     /// The bulb's displayed color, folding the warm-white channel back in.
@@ -69,7 +145,28 @@ impl PilotResult {
     }
 
     pub fn scene_name(&self) -> Option<&'static str> {
-        self.scene_id.and_then(|id| if id != 0 { get_scene_name(id) } else { None })
+        self.scene_id
+            .and_then(|id| if id != 0 { get_scene_name(id) } else { None })
+    }
+
+    /// Stable token for the controllable state. Telemetry (MAC/RSSI) is
+    /// intentionally absent. `src` is retained as typed status metadata but
+    /// excluded because it describes the controller, not the light state.
+    pub fn state_token(&self) -> String {
+        let snapshot = json!({
+            "state": self.state, "dimming": self.dimming, "sceneId": self.scene_id,
+            "r": self.r, "g": self.g, "b": self.b, "c": self.c, "w": self.w,
+            "temp": self.temp, "speed": self.speed, "schdPsetId": self.rhythm_id,
+            "ratio": self.ratio,
+        });
+        // A small deterministic FNV-1a fingerprint avoids a dependency while
+        // retaining a stable, opaque token across processes.
+        let mut hash = 0xcbf29ce484222325_u64;
+        for byte in serde_json::to_vec(&snapshot).expect("JSON values serialize") {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        format!("{hash:016x}")
     }
 }
 
@@ -85,52 +182,249 @@ pub fn send_udp_json(
     payload: &serde_json::Value,
     timeout: Duration,
 ) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
-    let clean_ip = validate_ip(ip)?;
+    Ok(send_udp_json_limited(ip, payload, timeout, None)?)
+}
+
+pub fn send_udp_json_limited(
+    ip: &str,
+    payload: &serde_json::Value,
+    timeout: Duration,
+    limiter: Option<&mut PacketRateLimiter>,
+) -> Result<Option<serde_json::Value>, BulbError> {
+    let clean_ip = validate_ip(ip).map_err(|error| BulbError::Message(error.to_string()))?;
+    let expected_ip: IpAddr = clean_ip
+        .parse()
+        .map_err(|e| BulbError::Message(format!("invalid WiZ IP {clean_ip}: {e}")))?;
     let socket = UdpSocket::bind("0.0.0.0:0")?;
     socket.set_read_timeout(Some(timeout))?;
     socket.set_write_timeout(Some(timeout))?;
 
     let msg = serde_json::to_vec(payload)?;
+    if let Some(limiter) = limiter {
+        limiter.wait();
+    }
     socket.send_to(&msg, format!("{clean_ip}:{WIZ_PORT}"))?;
 
     let mut buf = [0u8; 2048];
     match socket.recv_from(&mut buf) {
-        Ok((amt, _)) => {
+        Ok((amt, sender)) => {
+            if sender.ip() != expected_ip || sender.port() != WIZ_PORT {
+                return Err(BulbError::Message(format!(
+                    "ignored WiZ response from unexpected sender {sender}"
+                )));
+            }
             let res: serde_json::Value = serde_json::from_slice(&buf[..amt])?;
             Ok(Some(res))
         }
         Err(e) => {
-            if e.kind() == std::io::ErrorKind::TimedOut || e.kind() == std::io::ErrorKind::WouldBlock {
+            if e.kind() == std::io::ErrorKind::TimedOut
+                || e.kind() == std::io::ErrorKind::WouldBlock
+            {
                 Ok(None)
             } else {
-                Err(Box::new(e))
+                Err(BulbError::Io(e))
             }
         }
     }
 }
 
-pub fn send_pilot(ip: &str, params: serde_json::Value) -> Result<(), Box<dyn std::error::Error>> {
+pub fn send_pilot(ip: &str, params: serde_json::Value) -> Result<(), BulbError> {
+    send_pilot_limited(ip, params, None)
+}
+
+pub fn send_pilot_limited(
+    ip: &str,
+    params: serde_json::Value,
+    limiter: Option<&mut PacketRateLimiter>,
+) -> Result<(), BulbError> {
     let payload = json!({
         "method": "setPilot",
         "params": params
     });
-    // Send and attempt to read reply with 600ms timeout
-    let _ = send_udp_json(ip, &payload, DEFAULT_TIMEOUT)?;
+    let response = send_udp_json_limited(ip, &payload, DEFAULT_TIMEOUT, limiter)?
+        .ok_or_else(|| BulbError::Message(format!("setPilot request to bulb at {ip} timed out")))?;
+    if let Some(error) = response.get("error") {
+        return Err(BulbError::Message(format!("Bulb error: {error}")));
+    }
+    if let Some(method) = response.get("method") {
+        if method.as_str() != Some("setPilot") {
+            return Err(BulbError::Message(
+                "setPilot response has a mismatched method".to_string(),
+            ));
+        }
+    }
+    if response
+        .pointer("/result/success")
+        .and_then(|value| value.as_bool())
+        != Some(true)
+    {
+        return Err(BulbError::Message(
+            "setPilot response did not acknowledge success".to_string(),
+        ));
+    }
     Ok(())
 }
 
-pub fn get_pilot(ip: &str) -> Result<PilotResult, Box<dyn std::error::Error>> {
+pub fn get_pilot(ip: &str) -> Result<PilotResult, BulbError> {
+    get_pilot_limited(ip, None)
+}
+
+pub fn get_pilot_limited(
+    ip: &str,
+    limiter: Option<&mut PacketRateLimiter>,
+) -> Result<PilotResult, BulbError> {
     let payload = json!({ "method": "getPilot" });
-    let resp = send_udp_json(ip, &payload, Duration::from_millis(800))?
-        .ok_or_else(|| format!("request to bulb at {ip} timed out (check power and network connection)"))?;
+    let resp = send_udp_json_limited(ip, &payload, Duration::from_millis(800), limiter)?
+        .ok_or_else(|| {
+            BulbError::Message(format!(
+                "request to bulb at {ip} timed out (check power and network connection)"
+            ))
+        })?;
 
     if let Some(err) = resp.get("error") {
-        return Err(format!("Bulb error: {err}").into());
+        return Err(BulbError::Message(format!("Bulb error: {err}")));
+    }
+    if let Some(method) = resp.get("method") {
+        if method.as_str() != Some("getPilot") {
+            return Err(BulbError::Message(
+                "getPilot response has a mismatched method".to_string(),
+            ));
+        }
     }
 
-    let result = resp.get("result").ok_or_else(|| "Missing 'result' in response")?;
+    let result = resp
+        .get("result")
+        .ok_or_else(|| BulbError::Message("Missing 'result' in response".to_string()))?;
+    if result
+        .get("state")
+        .and_then(|value| value.as_bool())
+        .is_none()
+    {
+        return Err(BulbError::Message(
+            "getPilot response is missing boolean 'state'".to_string(),
+        ));
+    }
     let pilot: PilotResult = serde_json::from_value(result.clone())?;
     Ok(pilot)
+}
+
+/// Apply an optimistic, delta-only update. A fresh read happens before every
+/// write and another read confirms the actual outcome. WiZ has no atomic CAS,
+/// so the confirmation intentionally does not retry a competing write.
+pub fn apply_update(
+    ip: &str,
+    expected_state_token: Option<&str>,
+    params: serde_json::Value,
+) -> Result<PilotResult, BulbError> {
+    apply_update_limited(ip, expected_state_token, params, None)
+}
+
+pub fn apply_update_limited(
+    ip: &str,
+    expected_state_token: Option<&str>,
+    params: serde_json::Value,
+    mut limiter: Option<&mut PacketRateLimiter>,
+) -> Result<PilotResult, BulbError> {
+    let object = params
+        .as_object()
+        .ok_or_else(|| BulbError::Message("update parameters must be an object".to_string()))?;
+    if object.is_empty() {
+        return Err(BulbError::Message(
+            "apply_update requires at least one change".to_string(),
+        ));
+    }
+    const ALLOWED: &[&str] = &[
+        "state", "dimming", "sceneId", "r", "g", "b", "c", "w", "temp", "speed",
+    ];
+    if let Some(unknown) = object.keys().find(|key| !ALLOWED.contains(&key.as_str())) {
+        return Err(BulbError::Message(format!(
+            "unsupported update field '{unknown}'"
+        )));
+    }
+    if object.get("state").is_some_and(|value| !value.is_boolean()) {
+        return Err(BulbError::Message("state must be a boolean".to_string()));
+    }
+    for field in ["dimming", "r", "g", "b", "c", "w"] {
+        let maximum = if field == "dimming" { 100 } else { 255 };
+        if let Some(value) = object.get(field) {
+            if value.as_u64().is_none_or(|number| number > maximum) {
+                return Err(BulbError::Message(format!(
+                    "{field} must be an integer from 0 to {maximum}"
+                )));
+            }
+        }
+    }
+    if let Some(value) = object.get("temp") {
+        if value
+            .as_u64()
+            .is_none_or(|number| !(1000..=10000).contains(&number))
+        {
+            return Err(BulbError::Message(
+                "temp must be an integer from 1000 to 10000".to_string(),
+            ));
+        }
+    }
+    if let Some(value) = object.get("sceneId") {
+        let valid = value
+            .as_u64()
+            .is_some_and(|id| SCENES.iter().any(|(scene_id, _)| *scene_id as u64 == id));
+        if !valid {
+            return Err(BulbError::Message(
+                "sceneId must name a supported WiZ scene".to_string(),
+            ));
+        }
+    }
+    if let Some(value) = object.get("speed") {
+        if value
+            .as_u64()
+            .is_none_or(|number| !(10..=200).contains(&number))
+        {
+            return Err(BulbError::Message(
+                "speed must be an integer from 10 to 200".to_string(),
+            ));
+        }
+    }
+    let is_off = object.get("state").and_then(|v| v.as_bool()) == Some(false);
+    if is_off && object.len() != 1 {
+        return Err(BulbError::Message(
+            "a turn-off update cannot also contain light-mode changes".to_string(),
+        ));
+    }
+    let mode_count = [
+        object.contains_key("sceneId"),
+        object.contains_key("temp"),
+        ["r", "g", "b", "c", "w"]
+            .iter()
+            .any(|key| object.contains_key(*key)),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
+    if mode_count > 1 {
+        return Err(BulbError::Message(
+            "an update may contain only one light mode".to_string(),
+        ));
+    }
+
+    let current = get_pilot_limited(ip, limiter.as_deref_mut())?;
+    if let Some(expected) = expected_state_token {
+        if expected != current.state_token() {
+            return Err(BulbError::StateConflict {
+                expected: expected.to_string(),
+                current: Box::new(current),
+            });
+        }
+    }
+    // A duplicate `state: true` can reassert rhythm behaviour. Preserve a
+    // matching observation without emitting a packet or a needless readback.
+    if object.len() == 1
+        && object.get("state").and_then(|v| v.as_bool()) == Some(true)
+        && current.is_on()
+    {
+        return Ok(current);
+    }
+    send_pilot_limited(ip, params, limiter.as_deref_mut())?;
+    get_pilot_limited(ip, limiter)
 }
 
 pub fn get_favorites(ip: &str) -> Result<Vec<WiZclickFavorite>, Box<dyn std::error::Error>> {
@@ -163,17 +457,24 @@ pub fn get_favorites(ip: &str) -> Result<Vec<WiZclickFavorite>, Box<dyn std::err
 }
 
 pub fn set_power(ip: &str, state: bool) -> Result<(), Box<dyn std::error::Error>> {
-    send_pilot(ip, json!({ "state": state }))
+    apply_update(ip, None, json!({ "state": state }))
+        .map(|_| ())
+        .map_err(Into::into)
 }
 
 pub fn set_brightness(ip: &str, brightness: u8) -> Result<(), Box<dyn std::error::Error>> {
     let dim = ((brightness as f64 * 100.0 / 255.0).round() as u8).clamp(10, 100);
-    send_pilot(ip, json!({ "state": true, "dimming": dim }))
+    apply_update(ip, None, json!({ "state": true, "dimming": dim }))
+        .map(|_| ())
+        .map_err(Into::into)
 }
 
 pub fn set_temperature(ip: &str, kelvin: u16) -> Result<(), Box<dyn std::error::Error>> {
-    let temp = kelvin.clamp(2200, 6500);
-    send_pilot(ip, json!({ "state": true, "temp": temp }))
+    // The CLI accepts 1000..10000K. Do not silently narrow it to the GUI
+    // slider's practical range of 2200..6500K.
+    apply_update(ip, None, json!({ "state": true, "temp": kelvin }))
+        .map(|_| ())
+        .map_err(Into::into)
 }
 
 /// Convert an sRGB triple into the WiZ five-channel mix (`r`,`g`,`b` + warm white).
@@ -193,6 +494,12 @@ pub fn rgb_to_rgbcw(r: u8, g: u8, b: u8) -> ((u8, u8, u8), u8) {
         (-0.5, 0.866_025_403_784_438_6),
         (-0.5, -0.866_025_403_784_438_6),
     ];
+
+    // Black is an actual RGB choice. The generic zero-saturation path uses a
+    // fully-on white channel, which would incorrectly turn black into white.
+    if r == 0 && g == 0 && b == 0 {
+        return ((0, 0, 0), 0);
+    }
 
     let dot = |a: (f64, f64), b: (f64, f64)| a.0 * b.0 + a.1 * b.1;
 
@@ -296,11 +603,15 @@ pub fn rgb_pilot_params(r: u8, g: u8, b: u8) -> serde_json::Value {
 }
 
 pub fn set_rgb(ip: &str, r: u8, g: u8, b: u8) -> Result<(), Box<dyn std::error::Error>> {
-    send_pilot(ip, rgb_pilot_params(r, g, b))
+    apply_update(ip, None, rgb_pilot_params(r, g, b))
+        .map(|_| ())
+        .map_err(Into::into)
 }
 
 pub fn set_scene(ip: &str, scene_id: u32) -> Result<(), Box<dyn std::error::Error>> {
-    send_pilot(ip, json!({ "state": true, "sceneId": scene_id }))
+    apply_update(ip, None, json!({ "state": true, "sceneId": scene_id }))
+        .map(|_| ())
+        .map_err(Into::into)
 }
 
 #[allow(dead_code)]
@@ -311,14 +622,23 @@ pub fn apply_saved_state(ip: &str, state: &State) -> Result<(), Box<dyn std::err
 
     let dim = ((state.brightness as f64 * 100.0 / 255.0).round() as u8).clamp(10, 100);
     if state.mode == "scene" && state.scene_id > 0 {
-        send_pilot(ip, json!({ "state": true, "dimming": dim, "sceneId": state.scene_id }))?;
+        apply_update(
+            ip,
+            None,
+            json!({ "state": true, "dimming": dim, "sceneId": state.scene_id }),
+        )?;
     } else if state.mode == "kelvin" && state.kelvin > 0 {
-        let temp = state.kelvin.clamp(2200, 6500);
-        send_pilot(ip, json!({ "state": true, "dimming": dim, "temp": temp }))?;
+        let temp = state.kelvin;
+        apply_update(
+            ip,
+            None,
+            json!({ "state": true, "dimming": dim, "temp": temp }),
+        )?;
     } else {
         let ((pr, pg, pb), w) = rgb_to_rgbcw(state.rgb[0], state.rgb[1], state.rgb[2]);
-        send_pilot(
+        apply_update(
             ip,
+            None,
             json!({ "state": true, "dimming": dim, "r": pr, "g": pg, "b": pb, "w": w }),
         )?;
     }
@@ -340,7 +660,11 @@ pub fn command_off(ip: &str) -> Result<(), Box<dyn std::error::Error>> {
 pub fn command_toggle(ip: &str) -> Result<bool, Box<dyn std::error::Error>> {
     let pilot = get_pilot(ip)?;
     let new_state = !pilot.is_on();
-    set_power(ip, new_state)?;
+    apply_update(
+        ip,
+        Some(&pilot.state_token()),
+        json!({ "state": new_state }),
+    )?;
     if new_state {
         println!("✓ ON (toggled)");
     } else {
@@ -368,7 +692,11 @@ pub fn command_status(ip: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Some(sname) = pilot.scene_name() {
-        println!("Scene:      {} (ID: {})", sname, pilot.scene_id.unwrap_or(0));
+        println!(
+            "Scene:      {} (ID: {})",
+            sname,
+            pilot.scene_id.unwrap_or(0)
+        );
     } else if let Some(sid) = pilot.scene_id {
         if sid != 0 {
             println!("Scene:      ID {sid}");
@@ -404,7 +732,7 @@ pub fn command_status(ip: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub fn command_color(ip: &str, value: &str) -> Result<(u8, u8, u8), Box<dyn std::error::Error>> {
-    let (r, g, b) = parse_color(value).map_err(|e| e)?;
+    let (r, g, b) = parse_color(value)?;
     set_rgb(ip, r, g, b)?;
     let hex = rgb_to_hex(r, g, b);
     println!("✓ RGB({r}, {g}, {b}) ({hex})");
@@ -412,7 +740,7 @@ pub fn command_color(ip: &str, value: &str) -> Result<(u8, u8, u8), Box<dyn std:
 }
 
 pub fn command_brightness(ip: &str, value: &str) -> Result<u8, Box<dyn std::error::Error>> {
-    let b = parse_brightness(value).map_err(|e| e)?;
+    let b = parse_brightness(value)?;
     set_brightness(ip, b)?;
     let pct = (b as f64 * 100.0 / 255.0).round() as u8;
     println!("✓ Brightness {b}/255 ({pct}%)");
@@ -420,14 +748,17 @@ pub fn command_brightness(ip: &str, value: &str) -> Result<u8, Box<dyn std::erro
 }
 
 pub fn command_kelvin(ip: &str, value: &str) -> Result<u16, Box<dyn std::error::Error>> {
-    let k = parse_kelvin(value).map_err(|e| e)?;
+    let k = parse_kelvin(value)?;
     set_temperature(ip, k)?;
     println!("✓ {k}K");
     Ok(k)
 }
 
-pub fn command_scene(ip: &str, value: &str) -> Result<(u32, &'static str), Box<dyn std::error::Error>> {
-    let (sid, sname) = parse_scene(value).map_err(|e| e)?;
+pub fn command_scene(
+    ip: &str,
+    value: &str,
+) -> Result<(u32, &'static str), Box<dyn std::error::Error>> {
+    let (sid, sname) = parse_scene(value)?;
     set_scene(ip, sid)?;
     println!("✓ Scene {sid} ({sname})");
     Ok((sid, sname))
@@ -451,14 +782,26 @@ pub fn command_wizclick(ip: &str, mode: Option<u32>) -> Result<(), Box<dyn std::
     let mut favorites = get_favorites(ip).unwrap_or_default();
     if favorites.is_empty() {
         favorites = vec![
-            WiZclickFavorite { mode: 1, scene_id: 6, scene_name: "Cozy".to_string() },
-            WiZclickFavorite { mode: 2, scene_id: 14, scene_name: "Night light".to_string() },
+            WiZclickFavorite {
+                mode: 1,
+                scene_id: 6,
+                scene_name: "Cozy".to_string(),
+            },
+            WiZclickFavorite {
+                mode: 2,
+                scene_id: 14,
+                scene_name: "Night light".to_string(),
+            },
         ];
     }
 
     if let Some(m) = mode {
-        let matched = favorites.iter().find(|f| f.mode == m)
-            .ok_or_else(|| format!("WiZclick mode must be between 1 and {}, got {m}", favorites.len()))?;
+        let matched = favorites.iter().find(|f| f.mode == m).ok_or_else(|| {
+            format!(
+                "WiZclick mode must be between 1 and {}, got {m}",
+                favorites.len()
+            )
+        })?;
         set_scene(ip, matched.scene_id)?;
         println!("✓ WiZclick Mode {m} ({})", matched.scene_name);
         return Ok(());
@@ -467,7 +810,10 @@ pub fn command_wizclick(ip: &str, mode: Option<u32>) -> Result<(), Box<dyn std::
     println!("WiZclick Settings (Wall Switch Modes):");
     println!("----------------------------------------");
     for fav in &favorites {
-        println!("  Mode {} (Click {}): {} (Scene ID: {})", fav.mode, fav.mode, fav.scene_name, fav.scene_id);
+        println!(
+            "  Mode {} (Click {}): {} (Scene ID: {})",
+            fav.mode, fav.mode, fav.scene_name, fav.scene_id
+        );
     }
     println!("----------------------------------------");
     println!("Toggle physical wall switch once for Mode 1, twice quickly for Mode 2.");

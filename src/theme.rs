@@ -139,7 +139,11 @@ pub fn power_banner(ui: &mut Ui, is_on: bool, is_online: bool) -> Response {
             (false, false) => INPUT_BG,
             (false, true) => CARD_HOVER,
         };
-        let fg = if is_on { Color32::WHITE } else { TEXT_SECONDARY };
+        let fg = if is_on {
+            Color32::WHITE
+        } else {
+            TEXT_SECONDARY
+        };
 
         let painter = ui.painter();
         painter.rect_filled(rect, CornerRadius::same(7), fill);
@@ -171,7 +175,11 @@ pub fn wide_button(ui: &mut Ui, label: &str, height: f32) -> Response {
         ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click());
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
-        let fill = if response.hovered() { CARD_HOVER } else { INPUT_BG };
+        let fill = if response.hovered() {
+            CARD_HOVER
+        } else {
+            INPUT_BG
+        };
         painter.rect_filled(rect, CornerRadius::same(6), fill);
         painter.rect_stroke(
             rect,
@@ -229,7 +237,10 @@ pub fn window_button(ui: &mut Ui, kind: WinButton) -> Response {
 
     match kind {
         WinButton::Minimize => {
-            painter.line_segment([Pos2::new(c.x - 5.0, c.y), Pos2::new(c.x + 5.0, c.y)], stroke);
+            painter.line_segment(
+                [Pos2::new(c.x - 5.0, c.y), Pos2::new(c.x + 5.0, c.y)],
+                stroke,
+            );
         }
         WinButton::Maximize => {
             painter.rect_stroke(
@@ -247,11 +258,17 @@ pub fn window_button(ui: &mut Ui, kind: WinButton) -> Response {
                 egui::StrokeKind::Inside,
             );
             painter.line_segment(
-                [Pos2::new(c.x - 1.0, c.y - 2.5), Pos2::new(c.x + 3.0, c.y - 2.5)],
+                [
+                    Pos2::new(c.x - 1.0, c.y - 2.5),
+                    Pos2::new(c.x + 3.0, c.y - 2.5),
+                ],
                 stroke,
             );
             painter.line_segment(
-                [Pos2::new(c.x + 3.0, c.y - 2.5), Pos2::new(c.x + 3.0, c.y + 1.5)],
+                [
+                    Pos2::new(c.x + 3.0, c.y - 2.5),
+                    Pos2::new(c.x + 3.0, c.y + 1.5),
+                ],
                 stroke,
             );
         }
@@ -375,7 +392,11 @@ pub fn bulb_icon(painter: &egui::Painter, center: Pos2, radius: f32, is_on: bool
         Pos2::new(center.x - radius * 0.45, center.y + radius * 0.72),
         Pos2::new(center.x + radius * 0.45, center.y + radius * 1.25),
     );
-    painter.rect_filled(base, CornerRadius::same(2), Color32::from_rgb(0x55, 0x57, 0x5a));
+    painter.rect_filled(
+        base,
+        CornerRadius::same(2),
+        Color32::from_rgb(0x55, 0x57, 0x5a),
+    );
 }
 
 /// iOS-style pill switch. Returns `true` when the user flipped it.
@@ -402,7 +423,11 @@ pub fn pill_toggle(ui: &mut Ui, state: &mut bool) -> bool {
         };
         let knob = Pos2::new(knob_x, rect.center().y);
         painter.circle_filled(knob, knob_r, Color32::WHITE);
-        painter.circle_stroke(knob, knob_r, Stroke::new(1.0_f32, Color32::from_black_alpha(60)));
+        painter.circle_stroke(
+            knob,
+            knob_r,
+            Stroke::new(1.0_f32, Color32::from_black_alpha(60)),
+        );
     }
     changed
 }
@@ -436,8 +461,7 @@ pub fn swatch(ui: &mut Ui, color: Color32, size: Vec2, active: bool) -> Response
 
 /// Circular color dot used in the compact popover palette row.
 pub fn color_dot(ui: &mut Ui, color: Color32, radius: f32, active: bool) -> Response {
-    let (rect, response) =
-        ui.allocate_exact_size(Vec2::splat(radius * 2.0 + 2.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(radius * 2.0 + 2.0), Sense::click());
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         painter.circle_filled(rect.center(), radius, color);
@@ -503,7 +527,11 @@ fn slider_core(
 
         let knob = Pos2::new(usable.left() + t * usable.width(), rect.center().y);
         painter.circle_filled(knob, knob_r, Color32::WHITE);
-        painter.circle_stroke(knob, knob_r, Stroke::new(1.0_f32, Color32::from_black_alpha(80)));
+        painter.circle_stroke(
+            knob,
+            knob_r,
+            Stroke::new(1.0_f32, Color32::from_black_alpha(80)),
+        );
     }
 
     SliderOut {
@@ -542,7 +570,11 @@ pub fn gradient_slider(
                 Pos2::new(x0, track.top()),
                 Pos2::new(x0 + step_w + 0.5, track.bottom()),
             );
-            painter.rect_filled(seg, CornerRadius::ZERO, color_at(i as f32 / (STEPS - 1) as f32));
+            painter.rect_filled(
+                seg,
+                CornerRadius::ZERO,
+                color_at(i as f32 / (STEPS - 1) as f32),
+            );
         }
     })
 }
@@ -561,8 +593,7 @@ pub struct WheelOut {
 /// Value (brightness) is intentionally fixed at 1.0 — the bulb's brightness is
 /// driven by the dedicated brightness slider, matching the Python studio.
 pub fn color_wheel(ui: &mut Ui, diameter: f32, rgb: &mut [u8; 3]) -> WheelOut {
-    let (rect, response) =
-        ui.allocate_exact_size(Vec2::splat(diameter), Sense::click_and_drag());
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(diameter), Sense::click_and_drag());
     let center = rect.center();
     let radius = diameter / 2.0 - 2.0;
 
@@ -619,7 +650,11 @@ pub fn color_wheel(ui: &mut Ui, diameter: f32, rgb: &mut [u8; 3]) -> WheelOut {
         );
         painter.circle_filled(reticle, 7.0, Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
         painter.circle_stroke(reticle, 7.0, Stroke::new(2.0_f32, Color32::WHITE));
-        painter.circle_stroke(reticle, 8.5, Stroke::new(1.0_f32, Color32::from_black_alpha(120)));
+        painter.circle_stroke(
+            reticle,
+            8.5,
+            Stroke::new(1.0_f32, Color32::from_black_alpha(120)),
+        );
     }
 
     WheelOut {

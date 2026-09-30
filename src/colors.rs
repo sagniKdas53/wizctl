@@ -142,7 +142,11 @@ pub fn rgb_to_hsv(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
     };
 
     let hue = if hue < 0.0 { hue + 360.0 } else { hue };
-    let sat = if max <= f32::EPSILON { 0.0 } else { delta / max };
+    let sat = if max <= f32::EPSILON {
+        0.0
+    } else {
+        delta / max
+    };
     (hue, sat, max)
 }
 
@@ -186,7 +190,10 @@ pub fn parse_color(value: &str) -> Result<(u8, u8, u8), String> {
     }
 
     // Normalized named match (strip -, _, spaces)
-    let norm_val: String = val.chars().filter(|c| !c.is_whitespace() && *c != '-' && *c != '_').collect();
+    let norm_val: String = val
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-' && *c != '_')
+        .collect();
     for &(name, rgb) in NAMED_COLORS {
         if norm_val == name {
             return Ok(rgb);
@@ -204,7 +211,7 @@ pub fn parse_color(value: &str) -> Result<(u8, u8, u8), String> {
 
     // #RGB or RGB
     if hex_val.len() == 3 && hex_val.chars().all(|c| c.is_ascii_hexdigit()) {
-        let r_char = hex_val.chars().nth(0).unwrap();
+        let r_char = hex_val.chars().next().unwrap();
         let g_char = hex_val.chars().nth(1).unwrap();
         let b_char = hex_val.chars().nth(2).unwrap();
         let r = u8::from_str_radix(&format!("{r_char}{r_char}"), 16).map_err(|e| e.to_string())?;
@@ -216,7 +223,11 @@ pub fn parse_color(value: &str) -> Result<(u8, u8, u8), String> {
     // R, G, B
     let parts: Vec<&str> = val.split(',').map(|s| s.trim()).collect();
     if parts.len() == 3 {
-        if let (Ok(r), Ok(g), Ok(b)) = (parts[0].parse::<u8>(), parts[1].parse::<u8>(), parts[2].parse::<u8>()) {
+        if let (Ok(r), Ok(g), Ok(b)) = (
+            parts[0].parse::<u8>(),
+            parts[1].parse::<u8>(),
+            parts[2].parse::<u8>(),
+        ) {
             return Ok((r, g, b));
         }
     }
@@ -257,10 +268,10 @@ pub fn parse_kelvin(value: &str) -> Result<u16, String> {
         return Err("Kelvin value cannot be empty".to_string());
     }
 
-    let cleaned = val.trim_end_matches(|c| c == 'k' || c == 'K').trim();
-    let k = cleaned
-        .parse::<u32>()
-        .map_err(|_| format!("Invalid Kelvin temperature: '{value}'. Expected integer e.g. 2700 or 4000K"))?;
+    let cleaned = val.trim_end_matches(['k', 'K']).trim();
+    let k = cleaned.parse::<u32>().map_err(|_| {
+        format!("Invalid Kelvin temperature: '{value}'. Expected integer e.g. 2700 or 4000K")
+    })?;
 
     if !(1000..=10000).contains(&k) {
         return Err(format!(
@@ -287,15 +298,25 @@ pub fn parse_scene(value: &str) -> Result<(u32, &'static str), String> {
     }
 
     // Try parsing as scene name
-    let norm_val: String = val.to_lowercase().chars().filter(|c| !c.is_whitespace() && *c != '-' && *c != '_').collect();
+    let norm_val: String = val
+        .to_lowercase()
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-' && *c != '_')
+        .collect();
     for &(sid, sname) in SCENES {
-        let norm_sname: String = sname.to_lowercase().chars().filter(|c| !c.is_whitespace() && *c != '-' && *c != '_').collect();
+        let norm_sname: String = sname
+            .to_lowercase()
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '-' && *c != '_')
+            .collect();
         if norm_val == norm_sname {
             return Ok((sid, sname));
         }
     }
 
-    Err(format!("Unknown WiZ scene '{value}'. Run 'wizctl scenes' to list available scenes."))
+    Err(format!(
+        "Unknown WiZ scene '{value}'. Run 'wizctl scenes' to list available scenes."
+    ))
 }
 
 #[cfg(test)]

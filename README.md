@@ -2,7 +2,9 @@
 
 [![CI](https://github.com/sagniKdas53/wizctl/actions/workflows/ci.yml/badge.svg)](https://github.com/sagniKdas53/wizctl/actions/workflows/ci.yml)
 
-A high-performance native Rust application and smart desktop popover widget for controlling WiZ Connected smart light bulbs directly over local area network (LAN) using UDP JSON-RPC without cloud dependencies.
+A native Rust CLI and desktop controller for WiZ Connected smart light bulbs over the local LAN, using UDP JSON-RPC without cloud dependencies.
+
+Version 0.2 replaces the Python package and its importable API. Python consumers should retain the 0.1 source revision; Rust callers can use the `wizctl::bulb` module. The migration and feature coverage are recorded in [MIGRATION.md](MIGRATION.md).
 
 ---
 
@@ -11,6 +13,8 @@ A high-performance native Rust application and smart desktop popover widget for 
 The popover process exits when closed. The Rust build removes the Python and Tkinter runtime requirement. Startup time, open-window memory use, binary size, and XFCE window behavior need measurement on a desktop before comparing them with the targets in [the rewrite plan](WIZCTL_RUST_REWRITE_PLAN.md).
 
 The XFCE popover uses `xdotool` for cursor placement and `xdotool`/`xprop` for X11 window properties. Install those tools for the full panel behavior.
+
+The CLI and studio run on Linux, macOS, and Windows. The compact XFCE popover and panel installer are Linux/X11 features; `widget` opens the studio on other platforms. CI produces a standalone executable for each OS. The native studio image chooser uses zenity/kdialog on Linux, AppleScript on macOS, and the Windows file dialog on Windows.
 
 ---
 
@@ -127,7 +131,7 @@ wizctl palette photo.jpg --plain
 wizctl palette photo.jpg --colors 8 --apply 3
 wizctl palette photo.jpg --tui
 
-# Set color temperature in Kelvin (2200K - 6500K)
+# Set color temperature in Kelvin (1000K - 10000K; bulb support varies)
 wizctl kelvin 2700
 wizctl kelvin 4000K
 

@@ -12,8 +12,8 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 
 use eframe::egui::{
-    self, Align, Color32, CornerRadius, Layout, Margin, RichText, Sense, Stroke, TextureHandle,
-    Ui, Vec2, ViewportBuilder, ViewportCommand,
+    self, Align, Color32, CornerRadius, Layout, Margin, RichText, Sense, Stroke, TextureHandle, Ui,
+    Vec2, ViewportBuilder, ViewportCommand,
 };
 
 use crate::colors::{get_scene_name, kelvin_to_rgb, parse_color, rgb_to_hex, SCENES};
@@ -30,11 +30,20 @@ const WINDOW_TITLE: &str = "WiZ Controller - wizctl";
 const FEATURED_SCENES: [u32; 12] = [6, 3, 1, 29, 4, 14, 2, 7, 5, 23, 20, 31];
 
 /// Brightness quick presets: label -> raw 0..255 value.
-const BRIGHTNESS_PRESETS: [(&str, u8); 5] =
-    [("10%", 26), ("25%", 64), ("50%", 128), ("75%", 191), ("100%", 255)];
+const BRIGHTNESS_PRESETS: [(&str, u8); 5] = [
+    ("10%", 26),
+    ("25%", 64),
+    ("50%", 128),
+    ("75%", 191),
+    ("100%", 255),
+];
 
-const KELVIN_PRESETS: [(&str, u16); 4] =
-    [("2200K", 2200), ("2700K", 2700), ("4000K", 4000), ("6500K", 6500)];
+const KELVIN_PRESETS: [(&str, u16); 4] = [
+    ("2200K", 2200),
+    ("2700K", 2700),
+    ("4000K", 4000),
+    ("6500K", 6500),
+];
 
 const PALETTE_COUNTS: [(&str, usize); 4] = [("4", 4), ("6", 6), ("8", 8), ("12", 12)];
 
@@ -78,16 +87,71 @@ enum PaletteMsg {
     /// No chooser binary was available, or it failed to launch.
     ChooserFailed(String),
     Extracted {
+        generation: u64,
         path: PathBuf,
         palette: Vec<PaletteColor>,
         info: ImageInfo,
     },
-    Failed(String),
+    Failed {
+        generation: u64,
+        error: String,
+    },
 }
 
 /// Ask the desktop for an image path. Runs on a helper thread and always
 /// reports a terminal message so the caller's "chooser open" latch clears.
 fn run_file_chooser() -> PaletteMsg {
+    #[cfg(target_os = "windows")]
+    {
+        native_chooser(
+            "powershell",
+            &[
+                "-NoProfile",
+                "-Command",
+                "Add-Type -AssemblyName System.Windows.Forms; $d=New-Object System.Windows.Forms.OpenFileDialog; $d.Title='Select Image to Extract Color Palette'; $d.Filter='Image Files|*.jpg;*.jpeg;*.png;*.webp;*.bmp;*.gif;*.tif;*.tiff|All Files|*.*'; if($d.ShowDialog() -eq 'OK'){[Console]::Out.Write($d.FileName)}",
+            ],
+        )
+    }
+    #[cfg(target_os = "macos")]
+    {
+        native_chooser(
+            "osascript",
+            &[
+                "-e",
+                "POSIX path of (choose file with prompt \"Select Image to Extract Color Palette\")",
+            ],
+        )
+    }
+    #[cfg(target_os = "linux")]
+    {
+        run_linux_file_chooser()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        PaletteMsg::ChooserFailed(
+            "No native image chooser is available on this platform".to_string(),
+        )
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn native_chooser(program: &str, args: &[&str]) -> PaletteMsg {
+    match Command::new(program).args(args).output() {
+        Ok(out) if out.status.success() => {
+            let picked = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if picked.is_empty() {
+                PaletteMsg::Cancelled
+            } else {
+                PaletteMsg::Chosen(PathBuf::from(picked))
+            }
+        }
+        Ok(_) => PaletteMsg::Cancelled,
+        Err(e) => PaletteMsg::ChooserFailed(format!("{program} failed to launch: {e}")),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_linux_file_chooser() -> PaletteMsg {
     let zenity = Command::new("zenity")
         .arg("--file-selection")
         .arg("--title=Select Image to Extract Color Palette")
@@ -128,11 +192,9 @@ fn run_file_chooser() -> PaletteMsg {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
             PaletteMsg::ChooserFailed(format!("kdialog failed to launch: {e}"))
         }
-        Err(_) => {
-            PaletteMsg::ChooserFailed(
-                "No file chooser found (install zenity or kdialog)".to_string(),
-            )
-        }
+        Err(_) => PaletteMsg::ChooserFailed(
+            "No file chooser found (install zenity or kdialog)".to_string(),
+        ),
     }
 }
 
@@ -142,6 +204,8 @@ fn run_file_chooser() -> PaletteMsg {
 
 struct StudioApp {
     state: State,
+    /// The configured address, kept separate from a one-shot `studio --ip` target.
+    configured_ip: String,
     worker: BulbWorker,
     status: Status,
     tab: Tab,
@@ -167,6 +231,7 @@ struct StudioApp {
     extracting: bool,
     chooser_open: bool,
     files_hovering: bool,
+    palette_generation: u64,
     msg_tx: Sender<PaletteMsg>,
     msg_rx: Receiver<PaletteMsg>,
 
@@ -178,6 +243,7 @@ struct StudioApp {
 impl StudioApp {
     fn new(cc: &eframe::CreationContext<'_>, target_ip: Option<String>) -> Self {
         let mut state = load_state();
+        let configured_ip = state.ip.clone();
         if let Some(raw) = target_ip {
             if let Ok(ip) = validate_ip(&raw) {
                 state.ip = ip;
@@ -196,6 +262,7 @@ impl StudioApp {
             status: Status::Connecting,
             tab: Tab::Wheel,
             state,
+            configured_ip,
             worker,
             bright_dragging: false,
             kelvin_dragging: false,
@@ -208,6 +275,7 @@ impl StudioApp {
             extracting: false,
             chooser_open: false,
             files_hovering: false,
+            palette_generation: 0,
             msg_tx,
             msg_rx,
             log: format!("wizctl v{} - Ready", env!("CARGO_PKG_VERSION")),
@@ -233,7 +301,9 @@ impl StudioApp {
     }
 
     fn persist(&mut self) {
-        if let Err(e) = save_state(&self.state) {
+        // `studio --ip` is intentionally a one-shot target, like the widget.
+        let persisted = state_for_persistence(&self.state, &self.configured_ip);
+        if let Err(e) = save_state(&persisted) {
             self.log_err(format!("Could not save state: {e}"));
         }
     }
@@ -253,6 +323,7 @@ impl StudioApp {
             Ok(ip) => {
                 self.ip_input = ip.clone();
                 self.state.ip = ip.clone();
+                self.configured_ip = ip.clone();
                 self.worker.send(Cmd::SetIp(ip.clone()));
                 self.status = Status::Pinging;
                 self.log(format!("Pinging {ip}..."));
@@ -266,10 +337,7 @@ impl StudioApp {
         let next = !self.state.power;
         self.state.power = next;
         self.worker.send(Cmd::Power(next));
-        self.log(format!(
-            "Turning bulb {}",
-            if next { "ON" } else { "OFF" }
-        ));
+        self.log(format!("Turning bulb {}", if next { "ON" } else { "OFF" }));
         self.dirty = true;
     }
 
@@ -327,17 +395,16 @@ impl StudioApp {
 
     /// Re-push the saved preset after the bulb reappears on the network.
     fn restore_saved_preset(&mut self) {
-        self.worker.send(Cmd::Power(self.state.power));
-        match self.state.mode.as_str() {
-            "scene" => self.worker.send(Cmd::Scene(self.state.scene_id)),
-            "kelvin" => self.worker.send(Cmd::Kelvin(self.state.kelvin)),
-            _ => {
-                let [r, g, b] = self.state.rgb;
-                self.worker.send(Cmd::Rgb(r, g, b));
-            }
+        // Turning a saved-off bulb off must not also send a color/scene command:
+        // those commands imply `state: true`.  A saved-on preset is one atomic
+        // update so its optimistic state token cannot conflict with itself.
+        if !self.state.power {
+            self.worker.send(Cmd::Power(false));
+            return;
         }
-        self.worker
-            .send(Cmd::Brightness(self.state.brightness.max(1)));
+        self.worker.send(Cmd::Update(
+            saved_preset_update(&self.state).expect("saved-on state has an update"),
+        ));
     }
 
     // -- worker events ----------------------------------------------------
@@ -345,7 +412,7 @@ impl StudioApp {
     fn drain_events(&mut self) {
         while let Some(event) = self.worker.try_recv() {
             match event {
-                Event::Online { pilot, latency_ms } => self.apply_online(&pilot, latency_ms),
+                Event::Online { pilot, latency_ms } => self.apply_online(&pilot, latency_ms, true),
                 Event::Offline(err) => {
                     let was_online = self.is_online();
                     self.status = Status::Offline(err.clone());
@@ -353,11 +420,22 @@ impl StudioApp {
                         self.log_err(format!("Bulb unreachable: {err}"));
                     }
                 }
+                Event::Conflict { pilot, message } => {
+                    // A conflict is a fresh authoritative readback, never a reconnect.
+                    self.apply_online(&pilot, 0, false);
+                    self.log_err(format!("Command conflict: {message}"));
+                }
+                Event::CommandFailed(message) => self.log_err(format!("Command failed: {message}")),
             }
         }
     }
 
-    fn apply_online(&mut self, pilot: &crate::bulb::PilotResult, latency_ms: u32) {
+    fn apply_online(
+        &mut self,
+        pilot: &crate::bulb::PilotResult,
+        latency_ms: u32,
+        allow_restore: bool,
+    ) {
         let was_offline = !self.is_online();
         self.status = Status::Online {
             latency_ms,
@@ -365,7 +443,7 @@ impl StudioApp {
             rssi: pilot.rssi,
         };
 
-        if was_offline && self.state.restore_on_reconnect {
+        if allow_restore && was_offline && self.state.restore_on_reconnect {
             self.log("Bulb online - restoring saved preset to bulb...");
             self.restore_saved_preset();
             return;
@@ -420,6 +498,8 @@ impl StudioApp {
             let ip = self.state.ip.clone();
             self.log(format!("Connected to {ip} ({latency_ms}ms)"));
         }
+        // Poll/readback state is authoritative and must survive closing the app.
+        self.dirty = true;
     }
 
     // -- palette plumbing -------------------------------------------------
@@ -440,13 +520,12 @@ impl StudioApp {
 
     fn load_image(&mut self, path: PathBuf, ctx: &egui::Context) {
         if !palette::is_supported_image(&path) {
-            self.log_err(format!(
-                "Unsupported image type: {}",
-                file_label(&path)
-            ));
+            self.log_err(format!("Unsupported image type: {}", file_label(&path)));
             return;
         }
         self.image_path = Some(path.clone());
+        self.palette_generation = self.palette_generation.wrapping_add(1);
+        let generation = self.palette_generation;
         self.extracting = true;
         self.log(format!("Extracting colors from {}...", file_label(&path)));
 
@@ -457,13 +536,20 @@ impl StudioApp {
             let msg = match palette::load_image_info(&path, THUMB_MAX) {
                 Ok(info) => match palette::extract_palette(&path, count) {
                     Ok(colors) => PaletteMsg::Extracted {
+                        generation,
                         path,
                         palette: colors,
                         info,
                     },
-                    Err(e) => PaletteMsg::Failed(e),
+                    Err(e) => PaletteMsg::Failed {
+                        generation,
+                        error: e,
+                    },
                 },
-                Err(e) => PaletteMsg::Failed(e),
+                Err(e) => PaletteMsg::Failed {
+                    generation,
+                    error: e,
+                },
             };
             let _ = tx.send(msg);
             ctx.request_repaint();
@@ -486,11 +572,18 @@ impl StudioApp {
                     self.log_err(err);
                 }
                 PaletteMsg::Extracted {
+                    generation,
                     path,
                     palette,
                     info,
                 } => {
-                    self.extracting = false;
+                    if !apply_palette_result_state(
+                        generation,
+                        self.palette_generation,
+                        &mut self.extracting,
+                    ) {
+                        continue;
+                    }
                     self.thumb = upload_thumb(ctx, &info);
                     self.log(format!(
                         "Extracted {} colors from {}",
@@ -501,8 +594,17 @@ impl StudioApp {
                     self.image_info = Some(info);
                     self.image_path = Some(path);
                 }
-                PaletteMsg::Failed(err) => {
-                    self.extracting = false;
+                PaletteMsg::Failed {
+                    generation,
+                    error: err,
+                } => {
+                    if !apply_palette_result_state(
+                        generation,
+                        self.palette_generation,
+                        &mut self.extracting,
+                    ) {
+                        continue;
+                    }
                     self.log_err(format!("Error reading image palette: {err}"));
                 }
             }
@@ -519,11 +621,9 @@ impl StudioApp {
                 let edit_w = (ui.available_width() - button_w - 10.0).max(70.0);
                 let edit = ui.add_sized(
                     Vec2::new(edit_w, 22.0),
-                    egui::TextEdit::singleline(&mut self.ip_input)
-                        .font(egui::TextStyle::Monospace),
+                    egui::TextEdit::singleline(&mut self.ip_input).font(egui::TextStyle::Monospace),
                 );
-                let submitted =
-                    edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let submitted = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 if blue_button(ui, "Ping", button_w).clicked() || submitted {
                     self.do_ping();
                 }
@@ -638,12 +738,7 @@ impl StudioApp {
 
             ui.add_space(2.0);
             let current = self.state.brightness;
-            let picked = theme::chip_row(
-                ui,
-                &BRIGHTNESS_PRESETS,
-                |v: u8| v == current,
-                20.0,
-            );
+            let picked = theme::chip_row(ui, &BRIGHTNESS_PRESETS, |v: u8| v == current, 20.0);
             if let Some(v) = picked {
                 self.set_brightness(v);
             }
@@ -698,8 +793,7 @@ impl StudioApp {
                     egui::TextEdit::singleline(&mut self.hex_input)
                         .font(egui::TextStyle::Monospace),
                 );
-                let submitted =
-                    edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let submitted = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 if blue_button(ui, "Apply", button_w).clicked() || submitted {
                     let raw = self.hex_input.clone();
                     self.apply_hex(&raw);
@@ -722,8 +816,7 @@ impl StudioApp {
                 for hex in &recents {
                     if let Ok((r, g, b)) = parse_color(hex) {
                         let active = hex.eq_ignore_ascii_case(&active_hex);
-                        if theme::color_dot(ui, Color32::from_rgb(r, g, b), 9.0, active).clicked()
-                        {
+                        if theme::color_dot(ui, Color32::from_rgb(r, g, b), 9.0, active).clicked() {
                             picked = Some([r, g, b]);
                         }
                     }
@@ -789,6 +882,30 @@ impl StudioApp {
 
     fn scenes_body(&mut self, ui: &mut Ui) {
         theme::card(ui, |ui| {
+            theme::section(ui, "WIZCLICK QUICK SWITCH");
+            ui.horizontal(|ui| {
+                if theme::chip(
+                    ui,
+                    "Mode 1: Cozy",
+                    active_scene(&self.state) == Some(6),
+                    Vec2::new(132.0, 24.0),
+                )
+                .clicked()
+                {
+                    self.set_scene(6);
+                }
+                if theme::chip(
+                    ui,
+                    "Mode 2: Night light",
+                    active_scene(&self.state) == Some(14),
+                    Vec2::new(156.0, 24.0),
+                )
+                .clicked()
+                {
+                    self.set_scene(14);
+                }
+            });
+            ui.add_space(8.0);
             theme::section(ui, "FEATURED SCENES");
             ui.add_space(2.0);
 
@@ -853,7 +970,14 @@ impl StudioApp {
         let mut open_chooser = false;
         let zone = egui::Frame::new()
             .fill(theme::INPUT_BG)
-            .stroke(Stroke::new(if self.files_hovering { 2.0_f32 } else { 1.0_f32 }, border))
+            .stroke(Stroke::new(
+                if self.files_hovering {
+                    2.0_f32
+                } else {
+                    1.0_f32
+                },
+                border,
+            ))
             .corner_radius(CornerRadius::same(8))
             .inner_margin(Margin::symmetric(10, 9))
             .show(ui, |ui| {
@@ -1121,11 +1245,52 @@ impl StudioApp {
                 });
 
                 if close_requested {
-                    let _ = save_state(&self.state);
+                    self.persist();
                     ctx.send_viewport_cmd(ViewportCommand::Close);
                 }
             });
     }
+}
+
+fn active_scene(state: &State) -> Option<u32> {
+    (state.mode == "scene").then_some(state.scene_id)
+}
+
+fn state_for_persistence(state: &State, configured_ip: &str) -> State {
+    let mut persisted = state.clone();
+    persisted.ip = configured_ip.to_string();
+    persisted
+}
+
+/// Return the one atomic `setPilot` delta for a saved-on preset. A saved-off
+/// preset deliberately has no mode/brightness update because those turn it on.
+fn saved_preset_update(state: &State) -> Option<serde_json::Value> {
+    state.power.then(|| {
+        let mut update = serde_json::json!({
+            "state": true,
+            "dimming": ((state.brightness.max(1) as f64 * 100.0 / 255.0).round() as u8)
+                .clamp(10, 100),
+        });
+        let object = update.as_object_mut().expect("restore update is an object");
+        match state.mode.as_str() {
+            "scene" => {
+                object.insert("sceneId".into(), serde_json::json!(state.scene_id));
+            }
+            "kelvin" => {
+                object.insert("temp".into(), serde_json::json!(state.kelvin));
+            }
+            _ => {
+                let [r, g, b] = state.rgb;
+                for (key, value) in crate::bulb::rgb_pilot_params(r, g, b)
+                    .as_object()
+                    .expect("RGB params are an object")
+                {
+                    object.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        update
+    })
 }
 
 impl eframe::App for StudioApp {
@@ -1147,7 +1312,6 @@ impl eframe::App for StudioApp {
             egui::StrokeKind::Inside,
         );
 
-
         self.files_hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         if !dropped.is_empty() {
@@ -1161,6 +1325,22 @@ impl eframe::App for StudioApp {
                     self.load_image(path, ctx);
                 }
                 None => self.log_err("Dropped file is not a supported image"),
+            }
+        }
+
+        // Native clipboard paste arrives as an egui event. Leave it entirely to
+        // an active text editor (IP/hex fields); elsewhere, accept a local image
+        // path or file URI just as we accept a dropped image.
+        if ctx.memory(|memory| memory.focused().is_none()) {
+            let pasted_path = ctx.input(|input| {
+                input.events.iter().rev().find_map(|event| match event {
+                    egui::Event::Paste(text) => pasted_image_path(text),
+                    _ => None,
+                })
+            });
+            if let Some(path) = pasted_path {
+                self.tab = Tab::Palette;
+                self.load_image(path, ctx);
             }
         }
 
@@ -1220,7 +1400,7 @@ impl eframe::App for StudioApp {
         }
 
         if ctx.input(|i| i.viewport().close_requested()) {
-            let _ = save_state(&self.state);
+            self.persist();
         }
     }
 }
@@ -1250,6 +1430,68 @@ fn file_label(path: &Path) -> String {
         .unwrap_or_else(|| path.to_string_lossy().to_string())
 }
 
+/// Convert a clipboard file path (or `file://` URI) to a supported image path.
+/// File managers commonly paste one URI per line and percent-encode spaces.
+pub(crate) fn pasted_image_path(text: &str) -> Option<PathBuf> {
+    text.lines().find_map(|line| {
+        let line = line.trim().trim_matches('"');
+        let path = if let Some(uri) = line.strip_prefix("file://") {
+            let uri = if uri.starts_with('/') {
+                uri.to_string()
+            } else {
+                let (host, path) = uri.split_once('/')?;
+                (host.eq_ignore_ascii_case("localhost")).then(|| format!("/{path}"))?
+            };
+            let decoded = percent_decode(&uri)?;
+            // RFC file URIs use `/C:/...`; native Windows paths do not.
+            let decoded = decoded
+                .strip_prefix('/')
+                .filter(|value| value.as_bytes().get(1) == Some(&b':'))
+                .unwrap_or(&decoded);
+            PathBuf::from(decoded)
+        } else {
+            PathBuf::from(line)
+        };
+        palette::is_supported_image(&path).then_some(path)
+    })
+}
+
+fn percent_decode(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hi = *bytes.get(i + 1)?;
+            let lo = *bytes.get(i + 2)?;
+            let hex = |c: u8| match c {
+                b'0'..=b'9' => Some(c - b'0'),
+                b'a'..=b'f' => Some(c - b'a' + 10),
+                b'A'..=b'F' => Some(c - b'A' + 10),
+                _ => None,
+            };
+            decoded.push(hex(hi)? * 16 + hex(lo)?);
+            i += 3;
+        } else {
+            decoded.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn apply_palette_result_state(
+    generation: u64,
+    current_generation: u64,
+    extracting: &mut bool,
+) -> bool {
+    if generation != current_generation {
+        return false;
+    }
+    *extracting = false;
+    true
+}
+
 fn clip(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_string();
@@ -1272,11 +1514,7 @@ fn upload_thumb(ctx: &egui::Context, info: &ImageInfo) -> Option<TextureHandle> 
         [info.thumb_width, info.thumb_height],
         &info.thumb_rgba,
     );
-    Some(ctx.load_texture(
-        "studio_palette_thumb",
-        image,
-        egui::TextureOptions::LINEAR,
-    ))
+    Some(ctx.load_texture("studio_palette_thumb", image, egui::TextureOptions::LINEAR))
 }
 
 fn load_icon() -> Option<egui::IconData> {
@@ -1327,4 +1565,76 @@ pub fn run_studio(target_ip: Option<String>) -> Result<(), eframe::Error> {
             Ok(Box::new(StudioApp::new(cc, target_ip)))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_paste_accepts_path_and_file_uri() {
+        assert_eq!(
+            pasted_image_path("/tmp/cover image.PNG"),
+            Some(PathBuf::from("/tmp/cover image.PNG"))
+        );
+        assert_eq!(
+            pasted_image_path("file:///tmp/cover%20image.webp\r\n"),
+            Some(PathBuf::from("/tmp/cover image.webp"))
+        );
+        assert_eq!(
+            pasted_image_path("file://localhost/tmp/cover.png"),
+            Some(PathBuf::from("/tmp/cover.png"))
+        );
+        assert_eq!(
+            pasted_image_path("\"C:\\Pictures\\cover.jpg\""),
+            Some(PathBuf::from("C:\\Pictures\\cover.jpg"))
+        );
+        assert_eq!(pasted_image_path("file://server/share/a.png"), None);
+        assert_eq!(pasted_image_path("notes.txt"), None);
+    }
+
+    #[test]
+    fn stale_palette_result_cannot_clear_latest_extraction() {
+        let mut extracting = true;
+        assert!(!apply_palette_result_state(3, 4, &mut extracting));
+        assert!(
+            extracting,
+            "stale success/error must leave latest request pending"
+        );
+        assert!(apply_palette_result_state(4, 4, &mut extracting));
+        assert!(!extracting);
+    }
+
+    #[test]
+    fn temporary_studio_ip_is_not_persisted() {
+        let state = State {
+            ip: "10.0.0.25".into(),
+            ..State::default()
+        };
+        let persisted = state_for_persistence(&state, "192.168.0.102");
+        assert_eq!(persisted.ip, "192.168.0.102");
+    }
+
+    #[test]
+    fn saved_off_restore_only_needs_the_off_command() {
+        let state = State {
+            power: false,
+            mode: "scene".into(),
+            ..State::default()
+        };
+        assert_eq!(saved_preset_update(&state), None);
+    }
+
+    #[test]
+    fn saved_on_restore_is_one_delta_with_active_mode() {
+        let state = State {
+            mode: "kelvin".into(),
+            kelvin: 4000,
+            ..State::default()
+        };
+        let update = saved_preset_update(&state).unwrap();
+        assert_eq!(update["state"], true);
+        assert_eq!(update["temp"], 4000);
+        assert!(update.get("sceneId").is_none());
+    }
 }

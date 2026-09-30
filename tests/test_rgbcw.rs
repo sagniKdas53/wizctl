@@ -4,6 +4,11 @@
 //! `pywizlight`-compatible channel split that fixes it.
 
 use wizctl::bulb::{rgb_pilot_params, rgb_to_rgbcw, rgbcw_to_rgb, PilotResult};
+
+#[test]
+fn black_rgb_does_not_enable_the_white_channel() {
+    assert_eq!(rgb_to_rgbcw(0, 0, 0), ((0, 0, 0), 0));
+}
 use wizctl::colors::rgb_to_hsv;
 
 /// Warm off-white must drive the white LED, not the RGB LEDs.
@@ -15,7 +20,10 @@ fn near_white_lands_on_the_white_channel() {
         u16::from(r) + u16::from(g) + u16::from(b) < 80,
         "RGB LEDs should stay dim for a near-white pick, got ({r}, {g}, {b})"
     );
-    assert!(r > g && g >= b, "warm tint should lead on red: ({r}, {g}, {b})");
+    assert!(
+        r > g && g >= b,
+        "warm tint should lead on red: ({r}, {g}, {b})"
+    );
 }
 
 #[test]
@@ -59,7 +67,10 @@ fn roundtrip_preserves_hue() {
 
         let (want_h, want_s, _) = rgb_to_hsv(r, g, b);
         let (got_h, _, _) = rgb_to_hsv(br, bg, bb);
-        assert!(want_s >= 0.15, "fixture must be chromatic enough to have a hue");
+        assert!(
+            want_s >= 0.15,
+            "fixture must be chromatic enough to have a hue"
+        );
 
         let delta = (want_h - got_h).abs();
         let delta = delta.min(360.0 - delta);
@@ -110,7 +121,10 @@ fn readback_recognizes_the_color_it_was_given() {
         ..Default::default()
     };
 
-    assert!(pilot.matches_rgb(pick), "confirm poll should match the pick");
+    assert!(
+        pilot.matches_rgb(pick),
+        "confirm poll should match the pick"
+    );
     assert!(!pilot.matches_rgb([0x00, 0x1a, 0xc9]));
 }
 
@@ -124,5 +138,9 @@ fn all_channels_dark_reports_no_color() {
         temp: Some(2700),
         ..Default::default()
     };
-    assert_eq!(dark.rgb(), None, "white/scene mode must not read back as black");
+    assert_eq!(
+        dark.rgb(),
+        None,
+        "white/scene mode must not read back as black"
+    );
 }

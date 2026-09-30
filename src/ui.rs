@@ -10,9 +10,11 @@ use std::sync::mpsc::{channel, Receiver};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(target_os = "linux")]
+use eframe::egui::X11WindowType;
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontId, Layout, Pos2, Sense, Stroke, Vec2,
-    ViewportBuilder, ViewportCommand, X11WindowType,
+    ViewportBuilder, ViewportCommand,
 };
 
 use crate::colors::{kelvin_to_rgb, parse_color, rgb_to_hex};
@@ -39,6 +41,20 @@ const WIN_W: f32 = 340.0;
 const BASE_H: f32 = 444.0;
 const PICKER_H: f32 = 238.0;
 const PALETTE_ROW_H: f32 = 20.0;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MonitorBounds {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
+impl MonitorBounds {
+    fn contains(self, x: f32, y: f32) -> bool {
+        x >= self.x && x < self.x + self.width && y >= self.y && y < self.y + self.height
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Single-instance PID guard & debounce latch
@@ -70,7 +86,11 @@ pub fn runtime_dir() -> PathBuf {
 
 fn process_start_time(pid: u32) -> Option<String> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    stat.rsplit_once(") ")?.1.split_whitespace().nth(19).map(str::to_string)
+    stat.rsplit_once(") ")?
+        .1
+        .split_whitespace()
+        .nth(19)
+        .map(str::to_string)
 }
 
 fn now_millis() -> u128 {
@@ -113,9 +133,17 @@ pub fn check_single_instance() -> Option<PidGuard> {
         }
     }
 
-    let identity = format!("{}:{}", std::process::id(), process_start_time(std::process::id()).unwrap_or_default());
+    let identity = format!(
+        "{}:{}",
+        std::process::id(),
+        process_start_time(std::process::id()).unwrap_or_default()
+    );
     let _ = fs::write(&pid_file, &identity);
-    Some(PidGuard { pid_file, stamp_file, identity })
+    Some(PidGuard {
+        pid_file,
+        stamp_file,
+        identity,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -142,16 +170,48 @@ pub fn get_mouse_position() -> (f32, f32) {
     (600.0_f32, 26.0_f32)
 }
 
-fn display_width() -> f32 {
-    Command::new("xdotool")
-        .arg("getdisplaygeometry")
-        .output()
-        .ok()
+fn monitor_under_cursor(x: f32, y: f32) -> MonitorBounds {
+    let fallback = MonitorBounds {
+        x: 0.0,
+        y: 0.0,
+        width: 1920.0,
+        height: 1080.0,
+    };
+    let output = Command::new("xrandr").arg("--listmonitors").output().ok();
+    output
         .filter(|out| out.status.success())
         .and_then(|out| String::from_utf8(out.stdout).ok())
-        .and_then(|out| out.split_whitespace().next()?.parse::<f32>().ok())
-        .filter(|width| *width > 0.0)
-        .unwrap_or(1920.0)
+        .and_then(|text| {
+            monitors_from_xrandr(&text)
+                .into_iter()
+                .find(|monitor| monitor.contains(x, y))
+        })
+        .unwrap_or(fallback)
+}
+
+fn monitors_from_xrandr(text: &str) -> Vec<MonitorBounds> {
+    text.lines().filter_map(parse_xrandr_monitor).collect()
+}
+
+fn parse_xrandr_monitor(line: &str) -> Option<MonitorBounds> {
+    // `xrandr --listmonitors`: 0: +*DP-1 1920/509x1080/286+0+0 DP-1
+    let token = line
+        .split_whitespace()
+        .find(|word| word.contains('x') && (word.contains('+') || word[1..].contains('-')))?;
+    let (width, rest) = token.split_once('x')?;
+    let width = width.split('/').next()?.parse::<f32>().ok()?;
+    let offset = rest.find(['+', '-'])?;
+    let height = rest[..offset].split('/').next()?.parse::<f32>().ok()?;
+    let coordinates = &rest[offset..];
+    let second = coordinates[1..].find(['+', '-'])? + 1;
+    let x = coordinates[..second].parse::<f32>().ok()?;
+    let y = coordinates[second..].parse::<f32>().ok()?;
+    (width > 0.0 && height > 0.0).then_some(MonitorBounds {
+        x,
+        y,
+        width,
+        height,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -189,25 +249,29 @@ pub struct PopoverApp {
     show_picker: bool,
     palette: Option<DroppedPalette>,
     palette_error: Option<String>,
-    palette_rx: Option<Receiver<Result<DroppedPalette, String>>>,
+    palette_rx: Option<Receiver<(u64, Result<DroppedPalette, String>)>>,
     extracting: bool,
+    palette_generation: u64,
+    command_error: Option<String>,
     requested_height: f32,
     /// Screen position the popover was mapped at, and whether it hangs above
     /// the cursor. When it does, growth must extend upward so the popover never
     /// slides under the panel it was launched from.
     origin: Pos2,
     grows_upward: bool,
+    monitor: MonitorBounds,
     worker: BulbWorker,
     _pid_guard: Option<PidGuard>,
 }
 
 impl PopoverApp {
-    pub fn new(
+    fn new(
         cc: &eframe::CreationContext<'_>,
         target_ip: Option<String>,
         pid_guard: Option<PidGuard>,
         origin: Pos2,
         grows_upward: bool,
+        monitor: MonitorBounds,
     ) -> Self {
         theme::apply(&cc.egui_ctx);
 
@@ -237,9 +301,12 @@ impl PopoverApp {
             palette_error: None,
             palette_rx: None,
             extracting: false,
+            palette_generation: 0,
+            command_error: None,
             requested_height: BASE_H,
             origin,
             grows_upward,
+            monitor,
             worker,
             _pid_guard: pid_guard,
         }
@@ -274,7 +341,7 @@ impl PopoverApp {
         self.state.power = true;
         self.custom_color = Color32::from_rgb(r, g, b);
         self.record_recent(rgb_to_hex(r, g, b));
-        self.worker.send(Cmd::Rgb(r, g, b));
+        self.queue_command(Cmd::Rgb(r, g, b));
         self.persist_state();
     }
 
@@ -284,45 +351,57 @@ impl PopoverApp {
         self.state.recent_colors.truncate(16);
     }
 
+    fn queue_command(&mut self, cmd: Cmd) {
+        self.command_error = None;
+        self.worker.send(cmd);
+    }
+
+    fn apply_pilot(&mut self, pilot: &crate::bulb::PilotResult, latency_ms: u32) {
+        self.link = Link::Online;
+        self.latency_ms = latency_ms;
+        self.rssi = pilot.rssi;
+        if let Some(on) = pilot.state {
+            self.state.power = on;
+        }
+        if let Some(b255) = pilot.brightness_255() {
+            self.state.brightness = b255.max(1);
+            self.brightness = self.state.brightness as f32;
+        }
+        if let Some(k) = pilot.temp.filter(|k| *k > 0) {
+            self.state.kelvin = k;
+            self.kelvin = k.clamp(2200, 6500) as f32;
+            self.state.mode = "kelvin".to_string();
+        } else if let Some((r, g, b)) = pilot.rgb() {
+            if !pilot.matches_rgb(self.state.rgb) {
+                self.state.rgb = [r, g, b];
+                self.state.hex = rgb_to_hex(r, g, b);
+            }
+            self.state.mode = "color".to_string();
+        }
+        if let Some(sid) = pilot.scene_id.filter(|sid| *sid != 0) {
+            self.state.scene_id = sid;
+            self.state.mode = "scene".to_string();
+        }
+        self.persist_state();
+    }
+
     fn drain_worker(&mut self) {
         while let Some(evt) = self.worker.try_recv() {
             match evt {
                 Event::Online { pilot, latency_ms } => {
-                    self.link = Link::Online;
-                    self.latency_ms = latency_ms;
-                    self.rssi = pilot.rssi;
-
-                    if let Some(on) = pilot.state {
-                        self.state.power = on;
-                    }
-                    if let Some(b255) = pilot.brightness_255() {
-                        self.state.brightness = b255.max(1);
-                        self.brightness = self.state.brightness as f32;
-                    }
-                    if let Some(k) = pilot.temp.filter(|k| *k > 0) {
-                        self.state.kelvin = k;
-                        self.kelvin = k.clamp(2200, 6500) as f32;
-                        self.state.mode = "kelvin".to_string();
-                    } else if let Some((r, g, b)) = pilot.rgb() {
-                        // Adopting the readback of our own pick would drift the
-                        // hex, since the RGB/white split is lossy in brightness.
-                        if !pilot.matches_rgb(self.state.rgb) {
-                            self.state.rgb = [r, g, b];
-                            self.state.hex = rgb_to_hex(r, g, b);
-                        }
-                        self.state.mode = "color".to_string();
-                    }
-                    if let Some(sid) = pilot.scene_id {
-                        if sid != 0 {
-                            self.state.scene_id = sid;
-                            self.state.mode = "scene".to_string();
-                        }
-                    }
-                    self.persist_state();
+                    self.apply_pilot(&pilot, latency_ms);
+                    self.command_error = None;
                 }
                 Event::Offline(_) => {
                     self.link = Link::Offline;
                     self.rssi = None;
+                }
+                Event::Conflict { pilot, message } => {
+                    self.apply_pilot(&pilot, 0);
+                    self.command_error = Some(format!("Command conflict: {message}"));
+                }
+                Event::CommandFailed(message) => {
+                    self.command_error = Some(format!("Command failed: {message}"))
                 }
             }
         }
@@ -330,14 +409,14 @@ impl PopoverApp {
 
     fn drain_palette(&mut self) {
         let done = match self.palette_rx.as_ref() {
-            Some(rx) => match rx.try_recv() {
-                Ok(result) => Some(result),
-                Err(_) => None,
-            },
+            Some(rx) => rx.try_recv().ok(),
             None => None,
         };
 
-        if let Some(result) = done {
+        if let Some((generation, result)) = done {
+            if generation != self.palette_generation {
+                return;
+            }
             self.palette_rx = None;
             self.extracting = false;
             match result {
@@ -356,6 +435,8 @@ impl PopoverApp {
     fn start_extraction(&mut self, ctx: &egui::Context, path: PathBuf) {
         let (tx, rx) = channel();
         let ctx = ctx.clone();
+        self.palette_generation = self.palette_generation.wrapping_add(1);
+        let generation = self.palette_generation;
         self.palette_rx = Some(rx);
         self.extracting = true;
         self.palette_error = None;
@@ -366,7 +447,7 @@ impl PopoverApp {
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| path.display().to_string());
             let result = extract_palette(&path, 8).map(|colors| DroppedPalette { name, colors });
-            let _ = tx.send(result);
+            let _ = tx.send((generation, result));
             ctx.request_repaint();
         });
     }
@@ -404,7 +485,14 @@ impl PopoverApp {
                 let bottom = self.origin.y + self.requested_height;
                 ctx.send_viewport_cmd(ViewportCommand::OuterPosition(Pos2::new(
                     self.origin.x,
-                    (bottom - wanted).max(26.0),
+                    (bottom - wanted).max(self.monitor.y + 10.0),
+                )));
+            } else {
+                ctx.send_viewport_cmd(ViewportCommand::OuterPosition(Pos2::new(
+                    self.origin.x,
+                    (self.monitor.y + self.monitor.height - wanted - 10.0)
+                        .max(self.monitor.y + 10.0)
+                        .min(self.origin.y),
                 )));
             }
             self.requested_height = wanted;
@@ -476,10 +564,25 @@ fn custom_color_dot(ui: &mut egui::Ui, current: Color32, open: bool) -> egui::Re
             Color32::WHITE
         };
         let stroke = Stroke::new(1.8_f32, ink);
-        painter.line_segment([Pos2::new(c.x - arm, c.y), Pos2::new(c.x + arm, c.y)], stroke);
-        painter.line_segment([Pos2::new(c.x, c.y - arm), Pos2::new(c.x, c.y + arm)], stroke);
+        painter.line_segment(
+            [Pos2::new(c.x - arm, c.y), Pos2::new(c.x + arm, c.y)],
+            stroke,
+        );
+        painter.line_segment(
+            [Pos2::new(c.x, c.y - arm), Pos2::new(c.x, c.y + arm)],
+            stroke,
+        );
     }
     response.on_hover_text("Custom color")
+}
+
+fn clip_command_error(message: &str, max: usize) -> String {
+    if message.chars().count() <= max {
+        return message.to_string();
+    }
+    let mut clipped: String = message.chars().take(max.saturating_sub(1)).collect();
+    clipped.push('…');
+    clipped
 }
 
 impl eframe::App for PopoverApp {
@@ -517,6 +620,19 @@ impl eframe::App for PopoverApp {
         self.drain_worker();
         self.drain_palette();
         self.handle_dropped_files(ctx);
+        // Keep text-edit paste ownership with egui. A paste outside an editor
+        // can load an image palette just like a native file drop.
+        if ctx.memory(|memory| memory.focused().is_none()) {
+            let pasted_path = ctx.input(|input| {
+                input.events.iter().rev().find_map(|event| match event {
+                    egui::Event::Paste(text) => crate::studio::pasted_image_path(text),
+                    _ => None,
+                })
+            });
+            if let Some(path) = pasted_path {
+                self.start_extraction(ctx, path);
+            }
+        }
 
         let hovering_files = ctx.input(|i| !i.raw.hovered_files.is_empty());
         let glow = self.glow();
@@ -550,15 +666,9 @@ impl eframe::App for PopoverApp {
                             Some(r) => format!("{r} dBm"),
                             None => format!("{}ms", self.latency_ms),
                         };
-                        (
-                            theme::ACCENT_GREEN,
-                            format!("{} ({detail})", self.state.ip),
-                        )
+                        (theme::ACCENT_GREEN, format!("{} ({detail})", self.state.ip))
                     }
-                    Link::Pinging => (
-                        theme::ACCENT_AMBER,
-                        format!("Pinging {}...", self.state.ip),
-                    ),
+                    Link::Pinging => (theme::ACCENT_AMBER, format!("Pinging {}...", self.state.ip)),
                     Link::Offline => (theme::ACCENT_RED, "Offline".to_string()),
                 };
                 theme::status_dot(ui, dot_color);
@@ -579,6 +689,14 @@ impl eframe::App for PopoverApp {
                 });
             });
 
+            if let Some(error) = &self.command_error {
+                ui.label(
+                    egui::RichText::new(clip_command_error(error, 58))
+                        .color(theme::ACCENT_RED)
+                        .size(8.5),
+                );
+            }
+
             // ---------------------------------------------------------------
             // Power banner
             // ---------------------------------------------------------------
@@ -586,11 +704,11 @@ impl eframe::App for PopoverApp {
                 if self.link == Link::Offline {
                     // Unreachable: retry the connection instead of blind-toggling.
                     self.link = Link::Pinging;
-                    self.worker.send(Cmd::Ping);
+                    self.queue_command(Cmd::Ping);
                 } else {
                     self.state.power = !self.state.power;
-                    self.worker.send(Cmd::Power(self.state.power));
-                    self.worker.send(Cmd::Ping);
+                    self.queue_command(Cmd::Power(self.state.power));
+                    self.queue_command(Cmd::Ping);
                     self.persist_state();
                 }
             }
@@ -618,22 +736,24 @@ impl eframe::App for PopoverApp {
                     });
                 });
 
-                let out = theme::track_slider(ui, &mut self.brightness, 1.0, 255.0, theme::ACCENT_BLUE);
+                let out =
+                    theme::track_slider(ui, &mut self.brightness, 1.0, 255.0, theme::ACCENT_BLUE);
                 if out.changed {
                     self.state.brightness = self.brightness.round().clamp(1.0, 255.0) as u8;
                     self.state.power = true;
-                    self.worker.send(Cmd::Brightness(self.state.brightness));
+                    self.queue_command(Cmd::Brightness(self.state.brightness));
                 }
                 if out.released {
                     self.persist_state();
                 }
 
-                if let Some(val) = theme::chip_row(ui, QUICK_BRIGHTNESS, |v| self.state.brightness == v, 18.0)
+                if let Some(val) =
+                    theme::chip_row(ui, QUICK_BRIGHTNESS, |v| self.state.brightness == v, 18.0)
                 {
                     self.brightness = val as f32;
                     self.state.brightness = val;
                     self.state.power = true;
-                    self.worker.send(Cmd::Brightness(val));
+                    self.queue_command(Cmd::Brightness(val));
                     self.persist_state();
                 }
             });
@@ -662,7 +782,7 @@ impl eframe::App for PopoverApp {
                     self.state.kelvin = self.kelvin.round() as u16;
                     self.state.mode = "kelvin".to_string();
                     self.state.power = true;
-                    self.worker.send(Cmd::Kelvin(self.state.kelvin));
+                    self.queue_command(Cmd::Kelvin(self.state.kelvin));
                 }
                 if out.released {
                     self.persist_state();
@@ -678,7 +798,7 @@ impl eframe::App for PopoverApp {
                     self.state.kelvin = k;
                     self.state.mode = "kelvin".to_string();
                     self.state.power = true;
-                    self.worker.send(Cmd::Kelvin(k));
+                    self.queue_command(Cmd::Kelvin(k));
                     self.persist_state();
                 }
             });
@@ -697,7 +817,7 @@ impl eframe::App for PopoverApp {
                     self.state.scene_id = sid;
                     self.state.mode = "scene".to_string();
                     self.state.power = true;
-                    self.worker.send(Cmd::Scene(sid));
+                    self.queue_command(Cmd::Scene(sid));
                     self.persist_state();
                 }
             });
@@ -834,7 +954,11 @@ impl eframe::App for PopoverApp {
                 egui::Order::Foreground,
                 egui::Id::new("drop_hint"),
             ));
-            painter.rect_filled(screen, CornerRadius::same(10), Color32::from_black_alpha(200));
+            painter.rect_filled(
+                screen,
+                CornerRadius::same(10),
+                Color32::from_black_alpha(200),
+            );
             painter.rect_stroke(
                 screen.shrink(3.0),
                 CornerRadius::same(10),
@@ -862,6 +986,7 @@ impl eframe::App for PopoverApp {
 // ---------------------------------------------------------------------------
 // Launcher
 // ---------------------------------------------------------------------------
+#[cfg(target_os = "linux")]
 pub fn run_widget(target_ip: Option<String>) -> Result<(), eframe::Error> {
     let pid_guard = match check_single_instance() {
         Some(g) => g,
@@ -869,14 +994,18 @@ pub fn run_widget(target_ip: Option<String>) -> Result<(), eframe::Error> {
     };
 
     let (mx, my) = get_mouse_position();
-    let pos_x = (mx - WIN_W / 2.0).clamp(10.0, (display_width() - WIN_W - 10.0).max(10.0));
+    let monitor = monitor_under_cursor(mx, my);
+    let pos_x = (mx - WIN_W / 2.0).clamp(
+        monitor.x + 10.0,
+        (monitor.x + monitor.width - WIN_W - 10.0).max(monitor.x + 10.0),
+    );
     // Launched from a bottom panel the popover hangs above the cursor, so any
     // later growth has to push its top edge up rather than its bottom edge down.
-    let grows_upward = my >= 60.0;
+    let grows_upward = my >= monitor.y + 60.0;
     let pos_y = if grows_upward {
-        (my - BASE_H - 10.0).max(26.0)
+        (my - BASE_H - 10.0).max(monitor.y + 10.0)
     } else {
-        26.0
+        (monitor.y + 26.0).min((monitor.y + monitor.height - BASE_H - 10.0).max(monitor.y + 10.0))
     };
     let origin = Pos2::new(pos_x, pos_y);
 
@@ -895,12 +1024,13 @@ pub fn run_widget(target_ip: Option<String>) -> Result<(), eframe::Error> {
     };
 
     // EWMH property injection: no taskbar tab, no pager slot, stays above.
-    thread::spawn(|| {
+    let process_id = std::process::id().to_string();
+    thread::spawn(move || {
         thread::sleep(Duration::from_millis(40));
         let _ = Command::new("bash")
             .arg("-c")
             .arg("for ((attempt=0; attempt<100; attempt++)); do \
-                      WIN_ID=$(xdotool search --name 'wizctl - Quick Control' 2>/dev/null | tail -1); \
+                      WIN_ID=$(xdotool search --all --pid \"$1\" --name 'wizctl - Quick Control' 2>/dev/null | tail -1); \
                       if [ -n \"$WIN_ID\" ]; then break; fi; sleep 0.05; \
                   done; \
                   if [ -n \"$WIN_ID\" ]; then \
@@ -910,6 +1040,8 @@ pub fn run_widget(target_ip: Option<String>) -> Result<(), eframe::Error> {
                       xprop -id \"$WIN_ID\" -f _NET_WM_STATE 32a -set _NET_WM_STATE '_NET_WM_STATE_SKIP_TASKBAR, _NET_WM_STATE_SKIP_PAGER, _NET_WM_STATE_ABOVE'; \
                       xdotool windowraise \"$WIN_ID\" 2>/dev/null || true; \
                   fi")
+            .arg("wizctl-x11-window")
+            .arg(process_id)
             .status();
     });
 
@@ -923,7 +1055,47 @@ pub fn run_widget(target_ip: Option<String>) -> Result<(), eframe::Error> {
                 Some(pid_guard),
                 origin,
                 grows_upward,
+                monitor,
             )))
         }),
     )
+}
+
+/// The compact popover relies on X11 panel/window-manager behavior. Other
+/// platforms open the full Studio instead of attempting Linux-only helpers.
+#[cfg(not(target_os = "linux"))]
+pub fn run_widget(target_ip: Option<String>) -> Result<(), eframe::Error> {
+    crate::studio::run_studio(target_ip)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xrandr_monitor_parser_handles_offsets_and_edges() {
+        let monitors = monitors_from_xrandr(
+            "Monitors: 3\n 0: +*HDMI-1 1920/509x1080/286+0+0 HDMI-1\n 1: +DP-1 1280/338x1024/270-1280+0 DP-1\n 2: +DP-2 1024/270x768/203+0-768 DP-2\n",
+        );
+        assert_eq!(monitors.len(), 3);
+        assert!(monitors[0].contains(1919.0, 1079.0));
+        assert!(monitors[1].contains(-1.0, 0.0));
+        assert!(monitors[2].contains(0.0, -1.0));
+        assert!(!monitors[1].contains(0.0, 100.0));
+    }
+
+    #[test]
+    fn placement_clamps_inside_a_narrow_monitor() {
+        let monitor = MonitorBounds {
+            x: -1280.0,
+            y: 120.0,
+            width: 360.0,
+            height: 700.0,
+        };
+        let x = (-1270.0 - WIN_W / 2.0).clamp(
+            monitor.x + 10.0,
+            (monitor.x + monitor.width - WIN_W - 10.0).max(monitor.x + 10.0),
+        );
+        assert_eq!(x, -1270.0);
+    }
 }

@@ -64,7 +64,7 @@ pub fn extract_palette(path: &Path, colors: usize) -> Result<Vec<PaletteColor>, 
         1
     };
     let mut samples: Vec<[u8; 3]> = Vec::with_capacity(total / stride + 1);
-    for pixel in raw.chunks_exact(4).step_by(stride) {
+    for pixel in raw.as_chunks::<4>().0.iter().step_by(stride) {
         if pixel[3] > 0 {
             samples.push([pixel[0], pixel[1], pixel[2]]);
         }
@@ -210,7 +210,10 @@ fn median_cut(samples: &mut [[u8; 3]], target: usize) -> Vec<([u8; 3], usize)> {
             break;
         };
         let Bucket {
-            start, end, channel, ..
+            start,
+            end,
+            channel,
+            ..
         } = buckets[index];
         let slice = &mut samples[start..end];
         slice.sort_unstable_by_key(|pixel| pixel[channel]);
@@ -250,7 +253,7 @@ fn boundary_near_median(sorted: &[[u8; 3]], channel: usize) -> usize {
         if median + offset < len && is_boundary(median + offset) {
             return median + offset;
         }
-        if median >= offset + 1 && is_boundary(median - offset) {
+        if median > offset && is_boundary(median - offset) {
             return median - offset;
         }
     }
@@ -269,8 +272,7 @@ mod tests {
 
     impl TempImage {
         fn new(name: &str, width: u32, height: u32, fill: impl Fn(u32, u32) -> [u8; 4]) -> Self {
-            let image =
-                image::RgbaImage::from_fn(width, height, |x, y| image::Rgba(fill(x, y)));
+            let image = image::RgbaImage::from_fn(width, height, |x, y| image::Rgba(fill(x, y)));
             let path = std::env::temp_dir().join(format!(
                 "wizctl_palette_test_{}_{}.png",
                 name,
@@ -377,15 +379,16 @@ mod tests {
         let image = TempImage::new("empty", 12, 12, |_, _| [40, 40, 40, 0]);
         assert_eq!(
             extract_palette(&image.path, 3),
-            Err(format!("image has no visible pixels: {}", image.path.display()))
+            Err(format!(
+                "image has no visible pixels: {}",
+                image.path.display()
+            ))
         );
     }
 
     #[test]
     fn image_info_keeps_original_size_and_scales_thumbnail() {
-        let image = TempImage::new("info", 200, 100, |x, _| {
-            [(x % 256) as u8, 64, 128, 255]
-        });
+        let image = TempImage::new("info", 200, 100, |x, _| [(x % 256) as u8, 64, 128, 255]);
         let info = load_image_info(&image.path, 50).expect("info");
         assert_eq!((info.width, info.height), (200, 100));
         assert_eq!((info.thumb_width, info.thumb_height), (50, 25));

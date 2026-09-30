@@ -1,10 +1,15 @@
 use wizctl::{bulb, genmon, palette, state, studio, ui};
 
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEventKind},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode},
+};
 use std::env;
 use std::fs;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::Path;
-use std::process::{self, Stdio};
+use std::process;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -68,27 +73,30 @@ fn format_palette(image: &str, colors: &[palette::PaletteColor]) -> String {
     lines.join("\n")
 }
 
+#[cfg(windows)]
+fn supports_tui() -> bool {
+    io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+
+#[cfg(not(windows))]
 fn supports_tui() -> bool {
     io::stdin().is_terminal()
         && io::stdout().is_terminal()
         && env::var("TERM").map(|term| term != "dumb").unwrap_or(false)
 }
 
-#[cfg(unix)]
-struct TerminalMode(String);
+struct TerminalMode;
 
-#[cfg(unix)]
 impl Drop for TerminalMode {
     fn drop(&mut self) {
-        let _ = process::Command::new("stty").arg(&self.0).status();
-        let _ = io::stdout().write_all(b"\x1b[0m\x1b[?25h\n");
+        let _ = disable_raw_mode();
+        let mut stdout = io::stdout();
+        let _ = execute!(stdout, crossterm::style::ResetColor);
+        let _ = stdout.write_all(b"\x1b[?25h\n");
     }
 }
 
-/// Pick a color using only ANSI and `stty`, keeping the binary dependency-free.
-/// This is intentionally unavailable on non-Unix systems until a cross-platform
-/// terminal backend is introduced.
-#[cfg(unix)]
+/// Pick a color with Crossterm's cross-platform raw-mode and event APIs.
 fn choose_palette_color(
     image: &str,
     colors: &[palette::PaletteColor],
@@ -97,27 +105,10 @@ fn choose_palette_color(
     if !supports_tui() {
         return Err("palette picker needs an interactive ANSI terminal".to_string());
     }
-    let saved_mode = process::Command::new("stty")
-        .arg("-g")
-        .stdin(Stdio::inherit())
-        .output()
-        .map_err(|e| format!("palette picker could not configure terminal: {e}"))?;
-    if !saved_mode.status.success() {
-        return Err("palette picker could not configure terminal".to_string());
-    }
-    let saved_mode = String::from_utf8_lossy(&saved_mode.stdout)
-        .trim()
-        .to_string();
-    let _mode = TerminalMode(saved_mode);
-    let raw_status = process::Command::new("stty")
-        .args(["raw", "-echo", "min", "1", "time", "0"])
-        .status();
-    if !raw_status.is_ok_and(|status| status.success()) {
-        return Err("palette picker could not configure terminal".to_string());
-    }
+    enable_raw_mode().map_err(|e| format!("palette picker could not configure terminal: {e}"))?;
+    let _mode = TerminalMode;
 
     let mut stdout = io::stdout();
-    let mut stdin = io::stdin();
     let mut selected = 0usize;
     let result = loop {
         let mut frame = format!("\x1b[2J\x1b[H\x1b[1mImage palette\x1b[0m  {image}\n");
@@ -143,50 +134,29 @@ fn choose_palette_color(
         {
             break Err("palette picker could not write to terminal".to_string());
         }
-        let mut key = [0u8; 1];
-        if stdin.read_exact(&mut key).is_err() {
-            break Err("palette picker could not read from terminal".to_string());
-        }
-        match key[0] {
-            b'\r' | b'\n' => break Ok(Some(colors[selected])),
-            b'q' | 3 | 27 => {
-                // Arrow keys start with ESC. Treat a bare escape as cancel;
-                // briefly poll for a CSI tail so a lone Escape can dismiss.
-                if key[0] == 27 {
-                    let _ = process::Command::new("stty")
-                        .args(["min", "0", "time", "1"])
-                        .status();
-                    let mut tail = [0u8; 2];
-                    let has_tail = stdin.read_exact(&mut tail).is_ok();
-                    let _ = process::Command::new("stty")
-                        .args(["min", "1", "time", "0"])
-                        .status();
-                    if has_tail && tail == [b'[', b'A'] {
-                        selected = (selected + colors.len() - 1) % colors.len();
-                        continue;
-                    }
-                    if has_tail && tail == [b'[', b'B'] {
-                        selected = (selected + 1) % colors.len();
-                        continue;
-                    }
+        match event::read()
+            .map_err(|e| format!("palette picker could not read from terminal: {e}"))?
+        {
+            Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
+                KeyCode::Enter => break Ok(Some(colors[selected])),
+                KeyCode::Char('q') | KeyCode::Esc => break Ok(None),
+                KeyCode::Char('c')
+                    if key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
+                    break Ok(None)
                 }
-                break Ok(None);
-            }
-            b'k' => selected = (selected + colors.len() - 1) % colors.len(),
-            b'j' => selected = (selected + 1) % colors.len(),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    selected = (selected + colors.len() - 1) % colors.len()
+                }
+                KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1) % colors.len(),
+                _ => {}
+            },
             _ => {}
         }
     };
     result
-}
-
-#[cfg(not(unix))]
-fn choose_palette_color(
-    _: &str,
-    _: &[palette::PaletteColor],
-    _: &str,
-) -> Result<Option<palette::PaletteColor>, String> {
-    Err("palette picker is not available on this platform".to_string())
 }
 
 fn run_palette(target_ip: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
