@@ -7,23 +7,61 @@ on:
     branches: [main]
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
+  test-and-build:
+    name: Rust / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12"]
-
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - name: Install system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxcursor-dev libxrandr-dev libxi-dev libxinerama-dev libxkbcommon-dev libgl1-mesa-dev
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
-          python-version: ${{ matrix.python-version }}
+          components: rustfmt, clippy
 
-      - name: Install package with dev dependencies
-        run: pip install -e ".[dev]"
+      - name: Cargo check
+        run: cargo check --locked --verbose
 
-      - name: Run unit tests
-        run: pytest -v
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Lint
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Run test suite
+        run: cargo test --locked --verbose
+
+      - name: Build release binary
+        run: cargo build --locked --release
+
+      - name: CLI smoke check
+        shell: bash
+        run: |
+          binary=target/release/wizctl
+          if [ "$RUNNER_OS" = "Windows" ]; then binary="$binary.exe"; fi
+          "$binary" --version
+          "$binary" palette --help
+
+      - name: Stage binary artifact
+        shell: bash
+        run: |
+          mkdir artifact
+          binary=target/release/wizctl
+          if [ "$RUNNER_OS" = "Windows" ]; then binary="$binary.exe"; fi
+          cp "$binary" artifact/
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wizctl-${{ runner.os }}
+          path: artifact/
+          if-no-files-found: error

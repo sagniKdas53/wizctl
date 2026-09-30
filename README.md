@@ -2,75 +2,112 @@
 
 [![CI](https://github.com/sagniKdas53/wizctl/actions/workflows/ci.yml/badge.svg)](https://github.com/sagniKdas53/wizctl/actions/workflows/ci.yml)
 
-A fast, lightweight CLI tool and Python library for controlling WiZ Connected smart light bulbs directly over the local area network (LAN) using UDP broadcast/unicast protocol without cloud dependencies.
+A native Rust CLI and desktop controller for WiZ Connected smart light bulbs over the local LAN, using UDP JSON-RPC without cloud dependencies.
+
+Version 0.2 replaces the Python package and its importable API. Python consumers should retain the 0.1 source revision; Rust callers can use the `wizctl::bulb` module. The migration and feature coverage are recorded in [MIGRATION.md](MIGRATION.md).
 
 ---
 
-## Features
+## Runtime behavior
 
-- **Fast Local Control**: Directly controls WiZ bulbs over LAN UDP protocol (no cloud / bridge required).
-- **Comprehensive Controls**: Power (`on`, `off`, `toggle`), brightness, RGB colors, color temperatures (Kelvin), and dynamic WiZ scenes.
-- **Flexible Color Input**: Supports named colors (`warmwhite`, `red`, `cyan`, etc.), 6-digit hex (`#ff5500`), shorthand 3-digit hex (`#f50`), and RGB triples (`255, 128, 0`).
-- **Scene Presets**: Switch scenes by name (`cozy`, `sunset`, `ocean`, `candlelight`) or ID (`1`-`36`, `40`), and list all scenes with `wizctl scenes`.
-- **Standalone Binary**: Includes a standalone compiled binary executable with zero external runtime dependencies.
-- **Robust Error Handling**: Automatic UDP transport cleanup, timeout detection, and device reachability checks.
+The popover process exits when closed. The Rust build removes the Python and Tkinter runtime requirement. Startup time, open-window memory use, binary size, and XFCE window behavior need measurement on a desktop before comparing them with the targets in [the rewrite plan](WIZCTL_RUST_REWRITE_PLAN.md).
+
+The XFCE popover uses `xdotool` for cursor placement and `xdotool`/`xprop` for X11 window properties. Install those tools for the full panel behavior.
+
+The CLI and studio run on Linux, macOS, and Windows. The compact XFCE popover and panel installer are Linux/X11 features; `widget` opens the studio on other platforms. CI produces a standalone executable for each OS. The native studio image chooser uses zenity/kdialog on Linux, AppleScript on macOS, and the Windows file dialog on Windows.
+
+---
+
+## The "True Popover" Architectural Pillars
+
+1. **X11 Window Management (No Taskbar / Pager Tabs)**:
+   - Configured with `_NET_WM_WINDOW_TYPE_UTILITY` and `_NET_WM_STATE_SKIP_TASKBAR, _NET_WM_STATE_SKIP_PAGER, _NET_WM_STATE_ABOVE`.
+   - Never pollutes the taskbar or workspace switcher.
+2. **Dynamic Cursor-Anchored Placement**:
+   - Anchors directly beneath the mouse cursor upon clicking the panel icon.
+3. **Smart Click-Away Auto-Dismissal**:
+   - Focus tracking with startup grace period and drag protection; automatically closes when clicking away or pressing `Escape`.
+4. **Instant Single-Instance Toggling**:
+   - PID guard and close-debounce latch so clicking the panel launcher toggles the popover open and closed instantly.
+5. **Pixel-Accurate XFCE Dark Theme**:
+   - Dark palette with custom vector-drawn pill toggles, sliders, glowing bulb icons, and color swatches.
 
 ---
 
 ## Project Structure
 
 ```
-.
+wizctl/
+├── Cargo.toml           # Rust package definition and dependencies (eframe, serde, image)
+├── Makefile             # Build, install, test, and panel setup targets
 ├── src/
-│   └── wizctl/
-│       ├── __init__.py      # Package metadata & version
-│       ├── __main__.py      # python -m wizctl entry point
-│       ├── cli.py           # CLI argument parsing & commands
-│       ├── bulb.py          # WiZ communication & async connection manager
-│       ├── colors.py        # Named colors dictionary & RGB mappings
-│       └── parsers.py       # Color, brightness, and scene parsers
-├── tests/
-│   ├── conftest.py          # Pytest fixtures & mocks
-│   ├── test_parsers.py      # Unit tests for input parsing
-│   ├── test_cli.py          # Unit tests for CLI options & commands
-│   ├── test_bulb.py         # Async unit tests with mocked WiZ device
-│   └── test_integration.py  # Live device integration tests
-├── dist/
-│   └── wizctl               # Standalone compiled ELF binary
-├── pyproject.toml           # PEP 517/518 build configuration & dependencies
-├── Makefile                 # Developer build & test targets
-├── LICENSE                  # MIT license
-└── wizctl.py                # Direct repository launcher
+│   ├── lib.rs           # Core library module exports
+│   ├── main.rs          # CLI dispatcher, panel click handling, subcommand routing
+│   ├── ui.rs            # Compact popover: power banner, brightness/Kelvin presets, scenes,
+│   │                    #   quick colors, image drag & drop
+│   ├── studio.rs        # Full studio window: color wheel, Kelvin, scene browser, image palette
+│   ├── theme.rs         # Shared dark palette and hand-painted widget atoms (no icon fonts)
+│   ├── worker.rs        # Background UDP command pump with coalescing and ping backoff
+│   ├── palette.rs       # Median-cut dominant color extraction from images
+│   ├── bulb.rs          # Pure Rust WiZ UDP protocol (JSON-RPC on port 38899)
+│   ├── state.rs         # Local state cache (~/.config/wizctl/state.json)
+│   ├── colors.rs        # Preset colors, scene definitions, Kelvin/HSV conversions
+│   └── genmon.rs        # XFCE4 Genmon XML status provider with embedded icons
+├── assets/              # Lightbulb panel icons (on, off, offline, and app icons)
+├── scripts/
+│   └── setup_panel_widget.sh # Installs launcher desktop files and reloads xfce4-panel
+└── tests/               # Integration tests (UDP mock server, colors, state, genmon, palette)
 ```
+
+---
+
+## Two Surfaces
+
+| | `wizctl widget` (default) | `wizctl studio` (alias `wizctl gui`) |
+|---|---|---|
+| **Window** | Frameless popover anchored at the cursor | Frameless resizable window with a painted titlebar (drag to move, double-click to maximize) and egui resize grips |
+| **Dismissal** | Click-away, `Escape`, or panel re-click | Titlebar close button |
+| **Controls** | Power banner, brightness slider + 25/50/75/100% chips, Kelvin gradient slider + 2200/2700/4000/6500K chips, Cozy/Sunset/Ocean/Night scenes, quick color dots, inline custom color picker | Everything in the widget plus an IP/ping bar, HSV color wheel, full scene browser, and the image palette tab |
+| **Image palette** | Drop an image on the popover to replace the quick colors with its dominant colors | Drop an image or use `Select Image...`, with thumbnail, dominance percentages and 4/6/8/12 color counts |
 
 ---
 
 ## Quickstart
 
-### 1. Setup Virtual Environment
+### 1. Build from Source
+
+Requirements: A standard Rust toolchain (`cargo`, `rustc`).
 
 ```bash
-# Clone or navigate to the repository
-cd /path/to/light
+# Build optimized release binary
+make build
 
-# Create and activate virtual environment
-python3 -m venv .venv
-source .venv/bin/activate
-
-# Install the package in editable mode
-pip install -e ".[dev]"
+# Run tests
+make test
 ```
 
-Alternatively using the `Makefile`:
+### 2. Install & Configure XFCE Panel
+
 ```bash
-make install-dev
+# Installs binary to ~/.local/bin/wizctl and configures panel launcher
+make install
 ```
 
-### 2. Basic Usage
+---
 
-By default, `wizctl` targets `192.168.0.102` (or the IP configured in `WIZ_IP` / `BULB_IP` environment variables).
+## Usage
+
+By default, `wizctl` targets `192.168.0.102` (or the IP configured in `WIZ_IP` / `BULB_IP` environment variables or `~/.config/wizctl/state.json`). You can also pass `--ip <IP>`.
 
 ```bash
+# Launch the compact desktop popover widget (default)
+wizctl
+wizctl widget
+
+# Launch the full studio window (color wheel, Kelvin, scenes, image palette)
+wizctl gui
+wizctl studio
+
 # Check bulb status
 wizctl status
 
@@ -79,148 +116,44 @@ wizctl on
 wizctl off
 wizctl toggle
 
-# Set brightness (percentage or 0-255)
+# Set brightness (10%-100% or 25-255; 0 turns power OFF)
 wizctl brightness 80%
 wizctl brightness 200
 
 # Set color (name, hex, or RGB)
 wizctl color blue
-wizctl color #ff5500
+wizctl color '#ff5500'
 wizctl color "255, 128, 0"
 wizctl color warmwhite
 
-# Set color temperature in Kelvin (2200K - 6500K)
-wizctl kelvin 2700
-wizctl kelvin 4000
+# Extract an image palette; use --apply N to send a numbered color to the bulb
+wizctl palette photo.jpg --plain
+wizctl palette photo.jpg --colors 8 --apply 3
+wizctl palette photo.jpg --tui
 
-# Set dynamic scene preset (by name or ID)
+# Set color temperature in Kelvin (1000K - 10000K; bulb support varies)
+wizctl kelvin 2700
+wizctl kelvin 4000K
+
+# Set WiZ scene by name or numeric ID
 wizctl scene cozy
 wizctl scene sunset
-wizctl scene 1
+wizctl scene 6
 
-# List all available WiZ scenes
+# List all available scenes
 wizctl scenes
-```
 
----
+# View or activate WiZclick wall switch modes
+wizctl wizclick
+wizctl wizclick 1
+wizctl wizclick 2
 
-## CLI Reference
-
-```
-usage: wizctl [-h] [-v] [--ip IP] {on,off,toggle,status,color,brightness,kelvin,scene,scenes} ...
-
-positional arguments:
-  on                    turn the bulb on
-  off                   turn the bulb off
-  toggle                toggle bulb power state
-  status                show bulb status
-  color                 set RGB color (name, #RRGGBB, #RGB, or R,G,B)
-  brightness            set brightness (0-255 or 0%-100%)
-  kelvin                set color temperature in Kelvin (e.g. 2700, 4000)
-  scene                 set WiZ scene preset by name or ID (e.g. cozy, sunset, 1)
-  scenes                list all available WiZ scenes
-
-options:
-  -h, --help            show this help message and exit
-  -v, --version         show program's version number and exit
-  --ip IP               IP address of the WiZ bulb (default: 192.168.0.102)
-```
-
-### Specifying Target Bulb IP
-
-You can target a specific bulb using any of the following methods:
-
-1. **CLI Flag**: `wizctl --ip 192.168.0.102 status`
-2. **Environment Variable**: `export WIZ_IP=192.168.0.102` or `export BULB_IP=192.168.0.102`
-3. **Default Config**: Default fallback is `192.168.0.102`.
-
----
-
-## Standalone Compiled Binary
-
-A standalone executable binary is generated in `dist/wizctl`. It requires no Python installation or virtual environment to run.
-
-### Running the Binary
-
-```bash
-# Make sure binary is executable
-chmod +x ./dist/wizctl
-
-# Run commands directly
-./dist/wizctl status
-./dist/wizctl on
-./dist/wizctl color red
-./dist/wizctl scene cozy
-```
-
-### Rebuilding the Binary
-
-To compile the standalone binary from source using PyInstaller:
-
-```bash
-make binary
-```
-Or directly:
-```bash
-.venv/bin/pyinstaller --onefile --clean --name wizctl --paths src src/wizctl/__main__.py
-```
-
-The compiled binary will be placed at `dist/wizctl`.
-
----
-
-## Testing
-
-The project includes unit tests with mocks and integration tests for physical devices:
-
-### Run Unit Tests (125+ tests)
-
-```bash
-make test
-# or
-.venv/bin/pytest -v
-```
-
-### Run Live Device Integration Tests
-
-To run the live test cycle against the physical bulb at `192.168.0.102`:
-
-```bash
-make test-live
-# or
-.venv/bin/pytest -v --live tests/test_integration.py
-```
-
-*Note: The live test records the bulb's initial power, brightness, and color state, performs the test suite, and automatically restores the device back to its original state.*
-
----
-
-## Python API Usage
-
-`wizctl` can also be used as a Python library:
-
-```python
-import asyncio
-from wizctl.bulb import get_bulb, get_status_info, command_color
-from pywizlight import PilotBuilder
-
-async def main():
-    # Fetch bulb status
-    status = await get_status_info("192.168.0.102")
-    print(f"Power: {status['power']}, Brightness: {status['brightness']}")
-
-    # Set color
-    await command_color("192.168.0.102", "cyan")
-
-    # Or use async context manager for custom pilot controls
-    async with get_bulb("192.168.0.102") as bulb:
-        await bulb.turn_on(PilotBuilder(brightness=128, colortemp=2700))
-
-asyncio.run(main())
+# XFCE Genmon plugin status provider
+wizctl genmon
 ```
 
 ---
 
 ## License
 
-MIT License.
+MIT License. See [LICENSE](LICENSE) for details.

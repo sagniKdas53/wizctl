@@ -1,0 +1,19 @@
+{
+  "method": "getPilot",
+  "result": {
+    "mac": "00:11:22:33:44:55",
+    "rssi": -48,
+    "state": true,
+    "dimming": 50,
+    "sceneId": 6,
+    "r": 1,
+    "g": 2,
+    "b": 3,
+    "w": 0,
+    "temp": 3500,
+    "speed": 50,
+    "schdPsetId": 2,
+    "ratio": 100,
+    "src": 7
+  }
+}
