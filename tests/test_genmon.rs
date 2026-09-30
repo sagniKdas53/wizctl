@@ -14,7 +14,7 @@ fn test_genmon_xml_structure() {
     assert!(xml.contains("<click>"), "Missing <click> tag");
     assert!(xml.contains("</click>"), "Missing </click> tag");
     assert!(xml.contains("WiZ Smart Light (192.168.0.102)"));
-    assert!(xml.contains("wizctl widget --click"));
+    assert!(xml.contains("wizctl --ip 192.168.0.102 widget --click"));
 }
 
 #[test]
@@ -40,4 +40,15 @@ fn live_pilot_overrides_cached_panel_status() {
     let offline = render_genmon_xml("192.168.0.2", &state, None);
     assert!(offline.contains("panel_bulb_offline.png"));
     assert!(offline.contains("Bulb unreachable"));
+}
+
+#[test]
+fn click_handler_targets_the_displayed_bulb_instead_of_the_saved_default() {
+    let state = State {
+        ip: "192.0.2.11".into(),
+        ..State::default()
+    };
+    let xml = render_genmon_xml("10.0.0.5", &state, None);
+    assert!(xml.contains("<click>wizctl --ip 10.0.0.5 widget --click</click>"));
+    assert!(!xml.contains("--ip 192.0.2.11"));
 }

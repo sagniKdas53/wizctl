@@ -31,9 +31,12 @@ Reconnect preset restoration is an explicit opt-in. Restoring an OFF preset
 sends only power OFF. Restoring an ON preset sends its selected mode and
 brightness in one update; normal controls send only their requested fields.
 
-The six review regressions have dedicated coverage: timeout/rejected mutation,
-OFF restoration, black RGB, temporary studio IP, exact accepted Kelvin, and
-obsolete image extraction completions. State/schema, path normalization,
+The nine review regressions have dedicated coverage: timeout/rejected mutation,
+OFF restoration, black RGB, temporary studio IP, exact accepted Kelvin, obsolete
+image extraction completions, queued controls after worker-owned writes, active
+studio preset power-on intent, and Genmon click targeting. Queued controls
+advance through confirmed worker-owned state changes; external changes still
+reject the mutation without retrying it. State/schema, path normalization,
 protocol conflicts, readback, terminal CLI, and monitor placement also have
 automated coverage.
 

@@ -4,6 +4,7 @@
 //! slider traffic is coalesced (only the newest value of a given kind is sent)
 //! and the bulb is re-polled periodically with failure backoff.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -93,6 +94,47 @@ struct QueuedEvent {
     generation: u64,
 }
 
+/// Maps only this worker's confirmed state transitions. Queued UI gestures may
+/// rebase through it, but every write still performs a fresh prewrite read.
+#[derive(Default)]
+struct TokenLineage(HashMap<String, String>);
+
+impl TokenLineage {
+    fn resolve(&self, expected: Option<&str>) -> Option<String> {
+        let mut token = expected?.to_string();
+        while let Some(next) = self.0.get(&token) {
+            if next == &token {
+                break;
+            }
+            token = next.clone();
+        }
+        Some(token)
+    }
+
+    fn record(&mut self, expected: Option<String>, confirmed: String) {
+        if let Some(expected) = expected {
+            // Collapse every known self-transition to the latest endpoint.
+            // Returning to an earlier color/brightness must not create a cycle
+            // such as A -> B -> A and hang the next queued gesture.
+            for endpoint in self.0.values_mut() {
+                endpoint.clone_from(&confirmed);
+            }
+            self.0.insert(expected, confirmed.clone());
+            self.0.remove(&confirmed);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
+enum ApplyOutcome {
+    Applied(String),
+    Conflict,
+    Failed,
+}
+
 pub struct BulbWorker {
     tx: Sender<QueuedCmd>,
     rx: Receiver<QueuedEvent>,
@@ -101,6 +143,18 @@ pub struct BulbWorker {
 }
 
 impl BulbWorker {
+    #[cfg(test)]
+    pub(crate) fn inert() -> Self {
+        let (tx, _cmd_rx) = channel();
+        let (_event_tx, rx) = channel();
+        Self {
+            tx,
+            rx,
+            observed_token: Arc::new(Mutex::new(None)),
+            generation: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
     pub fn new(ip: String, ctx: egui::Context) -> Self {
         let (cmd_tx, cmd_rx) = channel::<QueuedCmd>();
         let (event_tx, event_rx) = channel::<QueuedEvent>();
@@ -115,6 +169,8 @@ impl BulbWorker {
             let mut next_poll = Instant::now();
             let mut limiter = PacketRateLimiter::new();
             let mut conflict_blocked = false;
+            let mut lineage = TokenLineage::default();
+            let mut last_confirmed_token: Option<String> = None;
 
             loop {
                 let now = Instant::now();
@@ -134,6 +190,8 @@ impl BulbWorker {
                                     ip = new_ip.clone();
                                     active_generation = pending.generation;
                                     conflict_blocked = false;
+                                    lineage.clear();
+                                    last_confirmed_token = None;
                                 } else if matches!(pending.cmd, Cmd::AcknowledgeConflict) {
                                     conflict_blocked = false;
                                 } else if conflict_blocked {
@@ -144,15 +202,22 @@ impl BulbWorker {
                                                 .to_string(),
                                         ),
                                     });
-                                } else if apply_and_report(
-                                    &ip,
-                                    &pending,
-                                    &mut limiter,
-                                    &event_tx,
-                                    &mut failures,
-                                    pending.generation,
-                                ) {
-                                    conflict_blocked = true;
+                                } else {
+                                    match apply_and_report(
+                                        &ip,
+                                        &pending,
+                                        &mut limiter,
+                                        &event_tx,
+                                        &mut failures,
+                                        pending.generation,
+                                        &mut lineage,
+                                    ) {
+                                        ApplyOutcome::Applied(token) => {
+                                            last_confirmed_token = Some(token)
+                                        }
+                                        ApplyOutcome::Conflict => conflict_blocked = true,
+                                        ApplyOutcome::Failed => {}
+                                    }
                                 }
                                 pending = next;
                             }
@@ -163,6 +228,8 @@ impl BulbWorker {
                             ip = new_ip.clone();
                             active_generation = pending.generation;
                             conflict_blocked = false;
+                            lineage.clear();
+                            last_confirmed_token = None;
                         } else if matches!(pending.cmd, Cmd::AcknowledgeConflict) {
                             conflict_blocked = false;
                         } else if conflict_blocked {
@@ -172,15 +239,20 @@ impl BulbWorker {
                                     "pending command discarded after a state conflict".to_string(),
                                 ),
                             });
-                        } else if apply_and_report(
-                            &ip,
-                            &pending,
-                            &mut limiter,
-                            &event_tx,
-                            &mut failures,
-                            pending.generation,
-                        ) {
-                            conflict_blocked = true;
+                        } else {
+                            match apply_and_report(
+                                &ip,
+                                &pending,
+                                &mut limiter,
+                                &event_tx,
+                                &mut failures,
+                                pending.generation,
+                                &mut lineage,
+                            ) {
+                                ApplyOutcome::Applied(token) => last_confirmed_token = Some(token),
+                                ApplyOutcome::Conflict => conflict_blocked = true,
+                                ApplyOutcome::Failed => {}
+                            }
                         }
 
                         let poll_now = matches!(pending.cmd, Cmd::Ping | Cmd::SetIp(_));
@@ -198,6 +270,14 @@ impl BulbWorker {
                         match get_pilot_limited(&ip, Some(&mut limiter)) {
                             Ok(pilot) => {
                                 failures = 0;
+                                let token = pilot.state_token();
+                                if last_confirmed_token
+                                    .as_deref()
+                                    .is_some_and(|previous| previous != token)
+                                {
+                                    lineage.clear();
+                                }
+                                last_confirmed_token = Some(token);
                                 let latency_ms = started.elapsed().as_millis().min(9999) as u32;
                                 if event_tx
                                     .send(QueuedEvent {
@@ -296,7 +376,8 @@ fn apply_and_report(
     event_tx: &Sender<QueuedEvent>,
     failures: &mut usize,
     generation: u64,
-) -> bool {
+    lineage: &mut TokenLineage,
+) -> ApplyOutcome {
     use serde_json::json;
     let params = match &queued.cmd {
         Cmd::Power(on) => json!({ "state": on }),
@@ -308,16 +389,14 @@ fn apply_and_report(
         Cmd::Rgb(r, g, b) => crate::bulb::rgb_pilot_params(*r, *g, *b),
         Cmd::Scene(sid) => json!({ "state": true, "sceneId": sid }),
         Cmd::Update(params) => params.clone(),
-        Cmd::SetIp(_) | Cmd::Ping | Cmd::AcknowledgeConflict => return false,
+        Cmd::SetIp(_) | Cmd::Ping | Cmd::AcknowledgeConflict => return ApplyOutcome::Failed,
     };
-    match apply_update_limited(
-        ip,
-        queued.expected_state_token.as_deref(),
-        params,
-        Some(limiter),
-    ) {
+    let expected = lineage.resolve(queued.expected_state_token.as_deref());
+    match apply_update_limited(ip, expected.as_deref(), params, Some(limiter)) {
         Ok(pilot) => {
             *failures = 0;
+            let confirmed = pilot.state_token();
+            lineage.record(expected, confirmed.clone());
             let _ = event_tx.send(QueuedEvent {
                 generation,
                 event: Event::Online {
@@ -325,9 +404,10 @@ fn apply_and_report(
                     latency_ms: 0,
                 },
             });
-            false
+            ApplyOutcome::Applied(confirmed)
         }
         Err(BulbError::StateConflict { current, .. }) => {
+            lineage.clear();
             let message = "bulb state changed; refresh before applying the change".to_string();
             let _ = event_tx.send(QueuedEvent {
                 generation,
@@ -336,7 +416,7 @@ fn apply_and_report(
                     message,
                 },
             });
-            true
+            ApplyOutcome::Conflict
         }
         Err(error) => {
             *failures = failures.saturating_add(1);
@@ -344,7 +424,7 @@ fn apply_and_report(
                 generation,
                 event: Event::CommandFailed(error.to_string()),
             });
-            false
+            ApplyOutcome::Failed
         }
     }
 }
@@ -355,11 +435,43 @@ mod tests {
     use std::sync::mpsc::channel;
 
     #[test]
+    fn returning_to_an_earlier_state_does_not_cycle_token_lineage() {
+        let mut lineage = TokenLineage::default();
+        lineage.record(Some("a".into()), "b".into());
+        lineage.record(Some("b".into()), "a".into());
+        assert_eq!(lineage.resolve(Some("a")).as_deref(), Some("a"));
+        assert_eq!(lineage.resolve(Some("b")).as_deref(), Some("a"));
+        lineage.record(Some("a".into()), "c".into());
+        assert_eq!(lineage.resolve(Some("b")).as_deref(), Some("c"));
+    }
+    use std::sync::{Mutex, OnceLock};
+
+    fn udp_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    fn wait_for_event(worker: &BulbWorker) -> Event {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            if let Some(event) = worker.try_recv() {
+                return event;
+            }
+            assert!(Instant::now() < deadline, "worker event timed out");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
     fn retarget_after_an_unconsumed_conflict_allows_a_fresh_command() {
         use serde_json::json;
         use std::net::UdpSocket;
 
+        let _serial = udp_lock();
         let server = UdpSocket::bind(("127.0.0.1", crate::bulb::WIZ_PORT)).unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         server
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -457,5 +569,130 @@ mod tests {
             .unwrap();
         assert!(worker.try_recv().is_none());
         assert!(worker.observed_token.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn queued_slider_value_rebases_after_our_confirmed_write() {
+        use serde_json::json;
+        use std::net::UdpSocket;
+
+        let _serial = udp_lock();
+        let server = UdpSocket::bind(("127.0.0.1", crate::bulb::WIZ_PORT)).unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let (first_write_tx, first_write_rx) = channel();
+        let responder = thread::spawn(move || {
+            for index in 0..7 {
+                let mut bytes = [0; 2048];
+                let (length, sender) = server.recv_from(&mut bytes).unwrap();
+                let request: serde_json::Value = serde_json::from_slice(&bytes[..length]).unwrap();
+                let result = match index {
+                    0 | 1 => {
+                        assert_eq!(request["method"], "getPilot");
+                        json!({"state":true,"dimming":50})
+                    }
+                    2 => {
+                        assert_eq!(
+                            request,
+                            json!({"method":"setPilot","params":{"state":true,"dimming":39}})
+                        );
+                        first_write_tx.send(()).unwrap();
+                        json!({"success":true})
+                    }
+                    3 | 4 => {
+                        assert_eq!(request["method"], "getPilot");
+                        json!({"state":true,"dimming":39})
+                    }
+                    5 => {
+                        assert_eq!(
+                            request,
+                            json!({"method":"setPilot","params":{"state":true,"dimming":78}})
+                        );
+                        json!({"success":true})
+                    }
+                    6 => json!({"state":true,"dimming":78}),
+                    _ => unreachable!(),
+                };
+                server
+                    .send_to(
+                        &serde_json::to_vec(&json!({"result":result})).unwrap(),
+                        sender,
+                    )
+                    .unwrap();
+            }
+        });
+        let worker = BulbWorker::new("127.0.0.1".into(), egui::Context::default());
+        let _ = wait_for_event(&worker); // initial displayed state establishes the UI token
+        worker.send(Cmd::Brightness(100));
+        first_write_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.send(Cmd::Brightness(200));
+        let mut final_dimming = None;
+        for _ in 0..2 {
+            if let Event::Online { pilot, .. } = wait_for_event(&worker) {
+                final_dimming = Some(pilot.dimming);
+            }
+        }
+        assert_eq!(final_dimming, Some(Some(78)));
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn external_change_between_queued_writes_conflicts_without_second_write() {
+        use serde_json::json;
+        use std::net::UdpSocket;
+
+        let _serial = udp_lock();
+        let server = UdpSocket::bind(("127.0.0.1", crate::bulb::WIZ_PORT)).unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let (first_write_tx, first_write_rx) = channel();
+        let responder = thread::spawn(move || {
+            for index in 0..5 {
+                let mut bytes = [0; 2048];
+                let (length, sender) = server.recv_from(&mut bytes).unwrap();
+                let request: serde_json::Value = serde_json::from_slice(&bytes[..length]).unwrap();
+                let result = match index {
+                    0 | 1 => {
+                        assert_eq!(request["method"], "getPilot");
+                        json!({"state":true,"dimming":50})
+                    }
+                    2 => {
+                        assert_eq!(request["method"], "setPilot");
+                        first_write_tx.send(()).unwrap();
+                        json!({"success":true})
+                    }
+                    3 => {
+                        assert_eq!(request["method"], "getPilot");
+                        json!({"state":true,"dimming":39})
+                    }
+                    4 => {
+                        assert_eq!(request["method"], "getPilot");
+                        json!({"state":true,"dimming":60})
+                    }
+                    _ => unreachable!(),
+                };
+                server
+                    .send_to(
+                        &serde_json::to_vec(&json!({"result":result})).unwrap(),
+                        sender,
+                    )
+                    .unwrap();
+            }
+        });
+        let worker = BulbWorker::new("127.0.0.1".into(), egui::Context::default());
+        let _ = wait_for_event(&worker);
+        worker.send(Cmd::Brightness(100));
+        first_write_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.send(Cmd::Brightness(200));
+        let mut saw_conflict = false;
+        for _ in 0..2 {
+            if matches!(wait_for_event(&worker), Event::Conflict { .. }) {
+                saw_conflict = true;
+            }
+        }
+        assert!(saw_conflict);
+        responder.join().unwrap();
     }
 }

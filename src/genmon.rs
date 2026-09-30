@@ -112,7 +112,7 @@ pub fn render_genmon_xml(ip: &str, state: &State, pilot: Option<&PilotResult>) -
     tooltip_lines.push("Left-click: Quick Widget | Double-click: Toggle".to_string());
     let tooltip = tooltip_lines.join("\n");
 
-    let click_cmd = "wizctl widget --click";
+    let click_cmd = format!("wizctl --ip {ip} widget --click");
 
     format!(
         "<img>{}</img>\n<txt> {} </txt>\n<tool>{}</tool>\n<click>{}</click>\n",

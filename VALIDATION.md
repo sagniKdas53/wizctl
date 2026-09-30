@@ -1,11 +1,12 @@
 # Rust merge validation (2026-09-30)
 
-Runtime changes were verified at `d9f7868`. The subsequent validation commit
-only adds this record and makes startup focus explicit in the X11 test script.
+The final review follow-up adds regression coverage for queued worker-owned
+writes, external changes during a queue, returning to an earlier state token,
+studio power-on intent, and Genmon click targeting.
 
 - `cargo fmt --check`: passed.
 - `cargo clippy --locked --all-targets -- -D warnings`: passed.
-- `cargo test --locked`: 66 passed, zero failures or ignored tests.
+- `cargo test --locked`: 71 passed, zero failures or ignored tests.
 - `cargo build --release --locked`: passed.
 - `bash -n scripts/setup_panel_widget.sh`: passed.
 - Interactive release palette picker in a PTY: `j` moved selection; `q`
@@ -13,10 +14,12 @@ only adds this record and makes startup focus explicit in the X11 test script.
 - Release X11 smoke: temporary studio IP stayed temporary after normal close;
   utility/skip-taskbar/skip-pager/above properties were observed; Escape,
   second-launch toggle and focus loss each closed the popover.
-- [Hosted three-OS CI](https://github.com/sagniKdas53/wizctl/actions/runs/36673966277):
-  Linux, macOS and Windows passed check, formatting, strict lint, tests, release
-  build, CLI smoke and binary artifact upload. OS-specific dependency-install
-  steps were deliberately skipped on non-Linux runners.
+- Initial [three-OS CI](https://github.com/sagniKdas53/wizctl/actions/runs/36673966277)
+  passed check, formatting, strict lint, tests, release build, CLI smoke and
+  binary artifact upload on Linux, macOS and Windows. The
+  [final PR checks](https://github.com/sagniKdas53/wizctl/pull/4/checks) cover the
+  subsequent review follow-up. OS-specific dependency-install steps are
+  deliberately skipped on non-Linux runners.
 
 The X11 smoke used a local fake UDP bulb and isolated configuration/runtime
 directories; no physical light was mutated. Its desktop was one 1920x1080 X11

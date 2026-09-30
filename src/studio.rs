@@ -251,6 +251,10 @@ impl StudioApp {
         }
 
         let worker = BulbWorker::new(state.ip.clone(), cc.egui_ctx.clone());
+        Self::from_state(state, configured_ip, worker)
+    }
+
+    fn from_state(state: State, configured_ip: String, worker: BulbWorker) -> Self {
         let (msg_tx, msg_rx) = channel();
 
         Self {
@@ -345,6 +349,7 @@ impl StudioApp {
         let value = value.max(1);
         self.brightness = value as f32;
         self.state.brightness = value;
+        self.state.power = true;
         self.worker.send(Cmd::Brightness(value));
         let pct = (value as u32 * 100 + 127) / 255;
         self.log(format!("Brightness set to {pct}% ({value}/255)"));
@@ -355,6 +360,7 @@ impl StudioApp {
         self.kelvin = kelvin as f32;
         self.state.kelvin = kelvin;
         self.state.mode = "kelvin".to_string();
+        self.state.power = true;
         self.worker.send(Cmd::Kelvin(kelvin));
         self.log(format!("White temperature set to {kelvin} K"));
         self.dirty = true;
@@ -363,6 +369,7 @@ impl StudioApp {
     fn set_scene(&mut self, scene_id: u32) {
         self.state.scene_id = scene_id;
         self.state.mode = "scene".to_string();
+        self.state.power = true;
         self.worker.send(Cmd::Scene(scene_id));
         let name = get_scene_name(scene_id).unwrap_or("Scene");
         self.log(format!("Scene set to {name} (id {scene_id})"));
@@ -376,6 +383,7 @@ impl StudioApp {
         self.state.rgb = rgb;
         self.state.hex = hex.clone();
         self.state.mode = "color".to_string();
+        self.state.power = true;
         self.hex_input = hex.clone();
         self.record_recent(&hex);
         self.worker.send(Cmd::Rgb(rgb[0], rgb[1], rgb[2]));
@@ -1570,6 +1578,32 @@ pub fn run_studio(target_ip: Option<String>) -> Result<(), eframe::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_controls_record_power_on_intent_before_network_readback() {
+        let state = State {
+            power: false,
+            ..State::default()
+        };
+        let mut app = StudioApp::from_state(state, "192.0.2.11".into(), BulbWorker::inert());
+        app.set_brightness(128);
+        assert!(app.state.power);
+        assert_eq!(app.state.brightness, 128);
+        app.state.power = false;
+        app.set_kelvin(3500);
+        assert!(app.state.power);
+        assert_eq!(app.state.mode, "kelvin");
+        app.state.power = false;
+        app.set_scene(6);
+        assert!(app.state.power);
+        assert_eq!(app.state.mode, "scene");
+        app.state.power = false;
+        app.commit_color([255, 0, 0], None);
+        let saved = state_for_persistence(&app.state, &app.configured_ip);
+        assert!(saved.power);
+        assert_eq!(saved.mode, "color");
+        assert_eq!(saved.rgb, [255, 0, 0]);
+    }
 
     #[test]
     fn image_paste_accepts_path_and_file_uri() {
