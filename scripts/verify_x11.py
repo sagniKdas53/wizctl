@@ -101,11 +101,15 @@ def main():
 
             widget = launch("widget")
             wid = wait_for(lambda: windows("wizctl - Quick Control", widget.pid), "widget visible")[-1]
+            subprocess.run(["xdotool", "windowactivate", "--sync", wid], check=True)
 
             def properties():
-                output = subprocess.check_output([
+                result = subprocess.run([
                     "xprop", "-id", wid, "_NET_WM_WINDOW_TYPE", "_NET_WM_STATE"
-                ], text=True)
+                ], text=True, capture_output=True, check=False)
+                if widget.poll() is not None:
+                    raise AssertionError(f"Popover exited during mapping: {widget.stderr.read().decode()}")
+                output = result.stdout
                 expected = ["UTILITY", "SKIP_TASKBAR", "SKIP_PAGER", "ABOVE"]
                 return output if all(value in output for value in expected) else None
 
