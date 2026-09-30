@@ -31,7 +31,7 @@ The Rust pipeline uses `cargo fmt --check`, `cargo clippy --locked --all-targets
 macOS and Windows. It uploads executable artifacts for each OS. The panel
 installer is specific to Linux/XFCE and is outside the CLI/studio build path.
 
-The automated cases cover all nine #4 review findings and the #2 behaviors:
+The automated cases cover all twelve #4 review findings and the #2 behaviors:
 fresh pre-write reads, stale-state rejection with fresh state attached,
 delta-only mutations, no-op ON, state-only OFF, and post-write readback.
 The LAN protocol still has no atomic compare-and-swap primitive. UI conflicts
